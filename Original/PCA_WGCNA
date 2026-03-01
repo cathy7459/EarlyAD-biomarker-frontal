@@ -1,0 +1,881 @@
+##PCA expansion
+expr_gene_all <- limma::avereps(expr_mapped, ID = map_df$symbol)
+
+##0~2 phase
+expr_gene_all <- expr_gene_all[, colnames(expr_gene_all), drop = FALSE]  # (그냥 안전용)
+expr_gene_all <- expr_gene_all[, colnames(expr_gene), drop = FALSE]      # PCA에 쓴 샘플 순서로 맞춤
+
+X_core <- t(expr_gene_all[core_features, , drop = FALSE])  # samples x core
+X_core <- scale(X_core)
+
+pca <- prcomp(X_core, center = TRUE, scale. = TRUE)
+
+K_fixed <- 4               # 엄격: PC 4개만
+drop_PC1 <- TRUE           # 엄격: PC1 제외(기술적 요인 억제)
+
+use_idx <- 1:K_fixed
+if (drop_PC1) use_idx <- use_idx[use_idx != 1]
+scores <- pca$x[, use_idx, drop = FALSE]    # samples x K_used
+
+cat("Using PCs:", paste(colnames(scores), collapse=", "), "\n")
+
+
+
+## =========================
+## 0) 입력 점검
+## =========================
+stopifnot(exists("scores"), exists("expr_gene_all"), exists("expr_gene"), exists("core_features"))
+expr_gene_all <- expr_gene_all[, rownames(scores), drop = FALSE]  # 샘플 순서 맞춤(중요)
+
+X_all <- t(expr_gene_all)        # samples x genes
+X_all <- scale(X_all)
+
+## =========================
+## 1) 단순상관 Cmat (genes x K_used)
+## =========================
+cor_with_pc <- function(x, y) suppressWarnings(cor(x, y, use = "pairwise.complete.obs"))
+
+Cmat <- sapply(1:ncol(scores), function(k) {
+  apply(X_all, 2, function(g) cor_with_pc(g, scores[, k]))
+})
+Cmat <- t(Cmat)                  # K_used x genes
+Cmat <- t(Cmat)                  # genes x K_used
+rownames(Cmat) <- colnames(X_all)
+
+## =========================
+## 2) 부분상관 PCmat (genes x K_used)
+##    - gene와 PCk 각각을 다른 PC들에 회귀 -> 잔차끼리 상관
+## =========================
+partial_cor_onegene <- function(g, S) {
+  K <- ncol(S)
+  out <- rep(NA_real_, K)
+  for (k in 1:K) {
+    if (K == 1) {
+      out[k] <- suppressWarnings(cor(g, S[, k], use = "pairwise.complete.obs"))
+    } else {
+      others <- S[, -k, drop = FALSE]
+      rg <- residuals(lm(g ~ others))
+      rk <- residuals(lm(S[, k] ~ others))
+      out[k] <- suppressWarnings(cor(rg, rk, use = "pairwise.complete.obs"))
+    }
+  }
+  out
+}
+
+PCmat <- t(apply(X_all, 2, partial_cor_onegene, S = scores))  # genes x K_used
+rownames(PCmat) <- colnames(X_all)
+
+## =========================
+## 3) "AND" 조건(>= m PCs 만족) 유지하되,
+##    thr_p, thr_s를 자동으로 찾기 (0개 방지)
+## =========================
+m <- 2  # 너가 원한 AND 강도 유지
+
+# 후보 임계값 그리드: 상관 분포를 보고 자동으로 탐색
+grid_p <- seq(0.60, 0.20, by = -0.02)  # 부분상관은 보통 작아서 더 낮은 범위까지
+grid_s <- seq(0.80, 0.30, by = -0.02)  # 단순상관은 더 크게 나오는 편
+
+target_max <- 800
+core_n <- length(unique(core_features))
+
+best <- NULL
+
+for (thr_p in grid_p) {
+  pass_p <- rowSums(abs(PCmat) >= thr_p, na.rm = TRUE) >= m
+  if (sum(pass_p) == 0) next
+  
+  for (thr_s in grid_s) {
+    pass_s <- rowSums(abs(Cmat) >= thr_s, na.rm = TRUE) >= m
+    keep1 <- pass_p & pass_s
+    
+    # core는 항상 포함이라 union 기준으로 본다
+    nn <- length(union(rownames(expr_gene), rownames(Cmat)[keep1]))
+    
+    # 0개 방지: 최소 후보가 core 외에도 조금은 있어야 함
+    if (nn > core_n && nn <= target_max) {
+      best <- list(thr_p = thr_p, thr_s = thr_s, nn = nn, keep1 = keep1)
+      break
+    }
+  }
+  if (!is.null(best)) break
+}
+
+# 만약 target_max 이하로 못 맞추면, "가장 가까운(최소 초과)" 조합을 찾음
+if (is.null(best)) {
+  best_dist <- Inf
+  best <- list(thr_p = NA_real_, thr_s = NA_real_, nn = NA_integer_, keep1 = rep(FALSE, nrow(Cmat)))
+  
+  for (thr_p in grid_p) {
+    pass_p <- rowSums(abs(PCmat) >= thr_p, na.rm = TRUE) >= m
+    if (sum(pass_p) == 0) next
+    
+    for (thr_s in grid_s) {
+      pass_s <- rowSums(abs(Cmat) >= thr_s, na.rm = TRUE) >= m
+      keep1 <- pass_p & pass_s
+      nn <- length(union(rownames(expr_gene), rownames(Cmat)[keep1]))
+      
+      # 목표(<=800)를 최우선, 불가능하면 초과량 최소
+      dist <- if (nn <= target_max) (target_max - nn) else (nn - target_max)
+      if (dist < best_dist && nn > core_n) {
+        best_dist <- dist
+        best <- list(thr_p = thr_p, thr_s = thr_s, nn = nn, keep1 = keep1)
+      }
+    }
+  }
+}
+
+cat("Chosen thresholds: thr_p =", best$thr_p, "thr_s =", best$thr_s, "\n")
+cat("Genes after AND filter (including core union):", best$nn, "\n")
+
+## =========================
+## 4) 그래도 800 초과면 Top-800으로 하드캡
+##    - 점수: 부분상관 상위 m개 평균 * 단순상관 상위 m개 평균
+## =========================
+cand_genes <- rownames(Cmat)[best$keep1]
+
+score_partial <- apply(abs(PCmat[cand_genes, , drop = FALSE]), 1, function(v) mean(sort(v, decreasing = TRUE)[1:m]))
+score_simple  <- apply(abs(Cmat[cand_genes, , drop = FALSE]), 1, function(v) mean(sort(v, decreasing = TRUE)[1:m]))
+score <- score_partial * score_simple
+
+# core 포함 후 800 맞추기
+ranked <- names(sort(score, decreasing = TRUE))
+ranked <- setdiff(ranked, rownames(expr_gene))  # core 제외하고 추가
+
+add_n <- max(0, target_max - length(unique(rownames(expr_gene))))
+add_genes <- head(ranked, add_n)
+
+core_features <- unique(c(rownames(expr_gene), add_genes))          # 확장된 gene 목록으로 덮어쓰기
+expr_gene <- expr_gene_all[core_features, , drop = FALSE]           # 확장 행렬로 덮어쓰기
+
+cat("FINAL expanded genes:", length(core_features), "\n")            # <= 800 보장
+cat("expr_gene dim:", dim(expr_gene)[1], "x", dim(expr_gene)[2], "\n")
+
+
+###개수가 너무 많아서 threshold 조절
+###그래도 개수 조절에 한계가 옴.(800보다 크면 줄여달라는 코드였음) 
+### 1547개로 WGCNA
+
+## =========================
+## 0) 준비: expr_gene 형태 점검/정리
+## =========================
+# expr_gene가 data.frame이고 GeneSymbol 컬럼이 있으면 matrix로 복구
+if (is.data.frame(expr_gene) && "GeneSymbol" %in% colnames(expr_gene)) {
+  rownames(expr_gene) <- expr_gene$GeneSymbol
+  expr_gene$GeneSymbol <- NULL
+  expr_gene <- as.matrix(expr_gene)
+}
+
+# 숫자형으로 강제
+expr_gene <- apply(expr_gene, 2, as.numeric)
+rownames(expr_gene) <- rownames(expr_gene)  # 안전
+colnames(expr_gene) <- colnames(expr_gene)
+
+# WGCNA는 samples x genes 형식을 선호
+datExpr <- t(expr_gene)  # 96 x 1547
+
+## =========================
+## 1) WGCNA 패키지 로드 & 기본 설정
+## =========================
+suppressPackageStartupMessages({
+  library(WGCNA)
+})
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()  # 멀티스레드 가능하면 사용
+
+## 결측/이상 샘플/유전자 체크
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0) {
+    cat("Removing genes:", paste(colnames(datExpr)[!gsg$goodGenes], collapse = ", "), "\n")
+  }
+  if (sum(!gsg$goodSamples) > 0) {
+    cat("Removing samples:", paste(rownames(datExpr)[!gsg$goodSamples], collapse = ", "), "\n")
+  }
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+## (선택) 샘플 클러스터링으로 아웃라이어 확인용
+sampleTree <- hclust(dist(datExpr), method = "average")
+# plot(sampleTree, main="Sample clustering", sub="", xlab="", cex.lab=1.5)
+
+## =========================
+## 2) Soft-threshold power 선택
+## =========================
+powers <- c(1:20)
+sft <- pickSoftThreshold(datExpr, powerVector = powers,
+                         networkType = "signed", verbose = 5)
+
+# 추천 power 자동 선택 (scale-free R^2가 0.8 이상 되는 최소 power 우선)
+fitTbl <- sft$fitIndices
+candidate <- fitTbl$Power[which(fitTbl$SFT.R.sq >= 0.80)]
+if (length(candidate) > 0) {
+  softPower <- min(candidate)
+} else {
+  # 0.8이 안 나오면 R^2가 최대인 power 사용
+  softPower <- fitTbl$Power[which.max(fitTbl$SFT.R.sq)]
+}
+cat("Chosen softPower =", softPower, "\n")
+
+## =========================
+## 3) 모듈 탐지 (blockwiseModules)
+## =========================
+# 1547 genes면 blockSize로 충분히 한 번에 처리 가능
+net <- blockwiseModules(
+  datExpr,
+  power = softPower,
+  networkType = "signed",
+  TOMType = "signed",
+  minModuleSize = 30,        # 모듈 최소 크기 (엄격하게 줄이려면 40~50)
+  reassignThreshold = 0,     # 보통 0
+  mergeCutHeight = 0.25,     # 모듈 병합 기준 (낮출수록 더 많이 병합됨: 0.15~0.25)
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = "TOM_1547genes",
+  verbose = 3
+)
+
+moduleLabels <- net$colors                  # numeric labels
+moduleColors <- labels2colors(moduleLabels) # "blue" 같은 색 라벨
+table(moduleColors)
+
+## =========================
+## 4) Module eigengenes 계산
+## =========================
+MEs0 <- moduleEigengenes(datExpr, colors = moduleColors)$eigengenes
+MEs  <- orderMEs(MEs0)  # 보기 좋게 정렬
+
+cat("Module eigengenes dim:", dim(MEs)[1], "samples x", dim(MEs)[2], "modules\n")
+
+## =========================
+## 5) (선택) 그룹(trait)과 ME 상관 확인
+## =========================
+# group_f가 존재하고, datExpr 샘플 순서와 일치한다고 가정
+if (exists("group_f")) {
+  # 샘플 이름 정합(필요 시)
+  # names(group_f) <- colnames(expr_gene) 같은 식으로 맞춰둔 경우가 이상적
+  trait <- data.frame(
+    Control = as.numeric(group_f == "Control"),
+    AsymAD  = as.numeric(group_f == "AsymAD"),
+    AD      = as.numeric(group_f == "AD")
+  )
+  rownames(trait) <- rownames(datExpr)
+  
+  modTraitCor <- cor(MEs, trait, use = "pairwise.complete.obs")
+  modTraitP   <- corPvalueStudent(modTraitCor, nSamples = nrow(datExpr))
+  
+  # 결과 저장
+  write.table(modTraitCor, file = "WGCNA_ME_trait_correlation.tsv",
+              sep = "\t", quote = FALSE)
+  write.table(modTraitP, file = "WGCNA_ME_trait_correlation_pvalues.tsv",
+              sep = "\t", quote = FALSE)
+}
+
+## =========================
+## 6) 저장 (LASSO에 바로 넣을 수 있게)
+## =========================
+# (1) 샘플 x 모듈 eigengene 테이블 (glmnet 입력으로 좋음)
+## =========================
+## 1) rownames 복구
+## =========================
+# rownames(expr_gene)가 NULL이면 core_features로 복구
+if (is.null(rownames(expr_gene)) || length(rownames(expr_gene)) == 0) {
+  
+  if (!exists("core_features")) {
+    stop("rownames(expr_gene)가 비어있고, 복구에 필요한 core_features도 없습니다.")
+  }
+  
+  if (length(core_features) != nrow(expr_gene)) {
+    stop("core_features 길이와 expr_gene 행 수가 다릅니다: ",
+         length(core_features), " vs ", nrow(expr_gene))
+  }
+  
+  rownames(expr_gene) <- core_features
+}
+
+cat("rownames(expr_gene) length =", length(rownames(expr_gene)), "\n")
+cat("head(rownames(expr_gene))  =", paste(head(rownames(expr_gene)), collapse = ", "), "\n")
+
+## =========================
+## 2) gene -> module 매핑 저장
+## =========================
+geneModule <- data.frame(
+  GeneSymbol  = rownames(expr_gene),
+  ModuleColor = moduleColors,
+  ModuleLabel = moduleLabels,
+  stringsAsFactors = FALSE
+)
+
+## =========================
+## 2) gene -> module 매핑 저장 (CSV)
+## =========================
+geneModule <- data.frame(
+  GeneSymbol  = rownames(expr_gene),
+  ModuleColor = moduleColors,
+  ModuleLabel = moduleLabels,
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  geneModule,
+  file = "WGCNA_GeneModuleMap_1547.csv",
+  row.names = FALSE
+)
+
+## =========================
+## 3) Module eigengenes 저장 (CSV)
+## =========================
+write.csv(
+  data.frame(Sample = rownames(MEs), MEs, check.names = FALSE),
+  file = "WGCNA_ModuleEigengenes_1547.csv",
+  row.names = FALSE
+)
+
+## =========================
+## 4) 전체 객체 저장 (RDS 그대로 유지)
+## =========================
+saveRDS(
+  list(
+    expr_gene = expr_gene,
+    net = net,
+    moduleColors = moduleColors,
+    moduleLabels = moduleLabels,
+    MEs = MEs,
+    geneModule = geneModule
+  ),
+  file = "WGCNA_1547genes_results.rds"
+)
+
+cat("Saved:\n - WGCNA_GeneModuleMap_1547.csv\n - WGCNA_ModuleEigengenes_1547.csv\n - WGCNA_1547genes_results.rds\n")
+
+##각각에 모듈 부여 완료 
+##이제 모듈 별로 허브 유전자 추출X
+##모듈을 지정하지 않고 전체에서 상관성이 큰 top 800 선정
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+})
+options(stringsAsFactors = FALSE)
+
+## 0) datExpr가 없으면 expr_gene로부터 생성 (samples x genes)
+if (!exists("datExpr")) {
+  if (is.data.frame(expr_gene) && "GeneSymbol" %in% colnames(expr_gene)) {
+    rownames(expr_gene) <- expr_gene$GeneSymbol
+    expr_gene$GeneSymbol <- NULL
+    expr_gene <- as.matrix(expr_gene)
+  }
+  # rownames 복구(가능할 때)
+  if ((is.null(rownames(expr_gene)) || length(rownames(expr_gene)) == 0) && exists("core_features")) {
+    if (length(core_features) == nrow(expr_gene)) rownames(expr_gene) <- core_features
+  }
+  
+  datExpr <- t(expr_gene)                 # samples x genes
+  colnames(datExpr) <- rownames(expr_gene)
+}
+
+stopifnot(exists("MEs"), exists("moduleColors"))
+
+## 1) 샘플 정렬 맞추기 (이게 안 맞으면 cor가 전부 NA로 터질 수 있음)
+# rownames가 둘 다 있으면 그걸로 맞춘다
+if (!is.null(rownames(datExpr)) && !is.null(rownames(MEs))) {
+  common_samp <- intersect(rownames(datExpr), rownames(MEs))
+  if (length(common_samp) < 5) stop("datExpr와 MEs의 공통 샘플명이 너무 적어요. rownames를 확인해줘.")
+  datExpr <- datExpr[common_samp, , drop = FALSE]
+  MEs     <- MEs[common_samp, , drop = FALSE]
+} else {
+  # rownames가 없으면 행 수가 같은지라도 확인
+  if (nrow(datExpr) != nrow(MEs)) stop("datExpr와 MEs의 샘플 수가 다릅니다. rownames를 맞춰야 해요.")
+}
+
+## 2) moduleColors 길이/타입 점검 (genes 길이와 맞아야 함)
+if (length(moduleColors) != ncol(datExpr)) {
+  stop("moduleColors 길이와 datExpr 유전자 수가 달라요: ",
+       length(moduleColors), " vs ", ncol(datExpr))
+}
+
+# moduleColors가 숫자 라벨이면(1,2,3...) 그대로, 색이면("blue") 그대로 사용
+module_id <- as.character(moduleColors)
+
+## 3) 각 유전자 i에 대해: 자기 모듈의 ME와 상관(|cor|) 계산 = absKME_own
+# MEs 컬럼명은 보통 "MEblue" 또는 "ME1" 형태
+me_cols <- colnames(MEs)
+
+get_me_col <- function(mod) {
+  # mod가 "blue"면 "MEblue", mod가 "1"이면 "ME1" 형태로 찾기
+  cand <- paste0("ME", mod)
+  if (cand %in% me_cols) return(cand)
+  
+  # 혹시 컬럼명이 다른 형태면(드물지만) 부분매칭 시도
+  cand2 <- me_cols[grepl(paste0("^ME", mod, "$"), me_cols)]
+  if (length(cand2) > 0) return(cand2[1])
+  
+  return(NA_character_)
+}
+
+me_for_gene <- vapply(module_id, get_me_col, character(1))
+
+absKME_own <- rep(NA_real_, ncol(datExpr))
+for (i in seq_len(ncol(datExpr))) {
+  mc <- me_for_gene[i]
+  if (is.na(mc)) next
+  absKME_own[i] <- abs(suppressWarnings(cor(datExpr[, i], MEs[, mc], use = "pairwise.complete.obs")))
+}
+
+cat("Non-NA absKME_own:", sum(!is.na(absKME_own)), "of", length(absKME_own), "\n")
+cat("Range(absKME_own):", paste(range(absKME_own, na.rm = TRUE), collapse = " ~ "), "\n")
+
+## 4) Top N 선택
+target_N <- 800  # 600으로 바꾸면 Top600
+
+ord <- order(absKME_own, decreasing = TRUE, na.last = NA)
+selected_genes <- colnames(datExpr)[ord]
+selected_genes <- head(selected_genes, min(target_N, length(selected_genes)))
+
+# 0개면 즉시 진단 정보 출력
+if (length(selected_genes) == 0) {
+  stop(
+    "selected_genes가 0개예요.\n",
+    "-> 보통 MEs 컬럼명과 moduleColors가 불일치하거나, MEs/datExpr 샘플 정렬이 깨진 경우입니다.\n",
+    "확인:\n",
+    "- head(colnames(MEs))\n",
+    "- head(moduleColors)\n",
+    "- head(rownames(datExpr)); head(rownames(MEs))"
+  )
+}
+
+## 5) 저장 (CSV)
+out <- data.frame(
+  GeneSymbol = selected_genes,
+  absKME_own = absKME_own[match(selected_genes, colnames(datExpr))],
+  ModuleID   = module_id[match(selected_genes, colnames(datExpr))],
+  ME_col     = me_for_gene[match(selected_genes, colnames(datExpr))],
+  stringsAsFactors = FALSE
+)
+
+write.csv(out, file = paste0("kME_Top", target_N, "_genes.csv"), row.names = FALSE)
+
+cat("Selected genes:", nrow(out), "\n")
+cat("Saved:", paste0("kME_Top", target_N, "_genes.csv"), "\n")
+
+##개수 제한 없이 상관성이 큰 유전자들로 뽑아보기
+##k설정에 따라 개수 달라짐 여기서는 700이 되는 0.75 설정
+suppressPackageStartupMessages({
+  library(WGCNA)
+})
+options(stringsAsFactors = FALSE)
+
+## 0) datExpr가 없으면 expr_gene로부터 생성
+if (!exists("datExpr")) {
+  if (is.data.frame(expr_gene) && "GeneSymbol" %in% colnames(expr_gene)) {
+    rownames(expr_gene) <- expr_gene$GeneSymbol
+    expr_gene$GeneSymbol <- NULL
+    expr_gene <- as.matrix(expr_gene)
+  }
+  if ((is.null(rownames(expr_gene)) || length(rownames(expr_gene)) == 0) && exists("core_features")) {
+    if (length(core_features) == nrow(expr_gene)) rownames(expr_gene) <- core_features
+  }
+  datExpr <- t(expr_gene)                 # samples x genes
+  colnames(datExpr) <- rownames(expr_gene)
+}
+
+stopifnot(exists("MEs"), exists("moduleColors"))
+stopifnot(length(moduleColors) == ncol(datExpr))
+
+## 1) 샘플 정렬 맞추기
+if (!is.null(rownames(datExpr)) && !is.null(rownames(MEs))) {
+  common_samp <- intersect(rownames(datExpr), rownames(MEs))
+  if (length(common_samp) < 5) stop("datExpr와 MEs의 공통 샘플명이 너무 적어요.")
+  datExpr <- datExpr[common_samp, , drop = FALSE]
+  MEs     <- MEs[common_samp, , drop = FALSE]
+} else {
+  if (nrow(datExpr) != nrow(MEs)) stop("datExpr와 MEs 샘플 수가 다릅니다(rownames 정렬 필요).")
+}
+
+## 2) absKME_own 계산 (자기 모듈 ME와의 |cor|)
+module_id <- as.character(moduleColors)
+me_cols <- colnames(MEs)
+
+get_me_col <- function(mod) {
+  cand <- paste0("ME", mod)
+  if (cand %in% me_cols) return(cand)
+  return(NA_character_)
+}
+me_for_gene <- vapply(module_id, get_me_col, character(1))
+
+absKME_own <- rep(NA_real_, ncol(datExpr))
+for (i in seq_len(ncol(datExpr))) {
+  mc <- me_for_gene[i]
+  if (is.na(mc)) next
+  absKME_own[i] <- abs(suppressWarnings(cor(datExpr[, i], MEs[, mc], use = "pairwise.complete.obs")))
+}
+
+cat("Non-NA absKME_own:", sum(!is.na(absKME_own)), "of", length(absKME_own), "\n")
+cat("Quantiles:\n")
+print(quantile(absKME_own, probs = c(.5,.6,.7,.75,.8,.85,.9,.95), na.rm = TRUE))
+
+## 3) 컷오프별 남는 유전자 수(개수 제한 없이 '큰 상관'만)
+cuts <- c(0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90)
+counts <- sapply(cuts, function(thr) sum(absKME_own >= thr, na.rm = TRUE))
+summary_tbl <- data.frame(kME_cut = cuts, n_genes = counts)
+print(summary_tbl)
+
+## 4) 원하는 컷오프 하나 선택해서 추출/저장
+kME_cutoff <- 0.75   # <- 여기만 바꿔가며 결과 보면 됨
+
+selected_genes <- colnames(datExpr)[which(absKME_own >= kME_cutoff)]
+selected_genes <- selected_genes[!is.na(selected_genes)]
+
+out <- data.frame(
+  GeneSymbol = selected_genes,
+  absKME_own = absKME_own[match(selected_genes, colnames(datExpr))],
+  ModuleID   = module_id[match(selected_genes, colnames(datExpr))],
+  ME_col     = me_for_gene[match(selected_genes, colnames(datExpr))],
+  stringsAsFactors = FALSE
+)
+
+out <- out[order(out$absKME_own, decreasing = TRUE), ]
+
+write.csv(out, file = paste0("kME_ge_", kME_cutoff, "_genes.csv"), row.names = FALSE)
+
+cat("Selected (kME >= ", kME_cutoff, "): ", nrow(out), "genes\n", sep = "")
+cat("Saved:", paste0("kME_ge_", kME_cutoff, "_genes.csv"), "\n")
+
+###plotting
+## =========================
+## 0) kME cutoff 설정 + absKME_own 계산(없으면 계산)
+## =========================
+kME_cutoff <- 0.75
+
+stopifnot(exists("datExpr"), exists("MEs"), exists("moduleColors"))
+stopifnot(length(moduleColors) == ncol(datExpr))
+
+# 샘플 정렬 맞추기(안 맞으면 cor가 NA 나올 수 있음)
+if (!is.null(rownames(datExpr)) && !is.null(rownames(MEs))) {
+  common_samp <- intersect(rownames(datExpr), rownames(MEs))
+  datExpr <- datExpr[common_samp, , drop = FALSE]
+  MEs     <- MEs[common_samp, , drop = FALSE]
+} else {
+  if (nrow(datExpr) != nrow(MEs)) stop("datExpr와 MEs의 샘플 수가 달라요(rownames 정렬 필요).")
+}
+
+module_id <- as.character(moduleColors)
+me_cols <- colnames(MEs)
+
+get_me_col <- function(mod) {
+  cand <- paste0("ME", mod)
+  if (cand %in% me_cols) return(cand)
+  return(NA_character_)
+}
+me_for_gene <- vapply(module_id, get_me_col, character(1))
+
+absKME_own <- rep(NA_real_, ncol(datExpr))
+for (i in seq_len(ncol(datExpr))) {
+  mc <- me_for_gene[i]
+  if (is.na(mc)) next
+  absKME_own[i] <- abs(suppressWarnings(cor(datExpr[, i], MEs[, mc], use = "pairwise.complete.obs")))
+}
+
+# cutoff로 선택
+selected_idx <- which(absKME_own >= kME_cutoff & !is.na(absKME_own))
+selected_genes <- colnames(datExpr)[selected_idx]
+
+cat("kME cutoff =", kME_cutoff, "\n")
+cat("Selected genes:", length(selected_genes), " / ", ncol(datExpr), "\n", sep="")
+
+## 결과 테이블(원하면 저장)
+selected_tbl <- data.frame(
+  GeneSymbol  = selected_genes,
+  absKME_own  = absKME_own[selected_idx],
+  ModuleID    = module_id[selected_idx],
+  ME_col      = me_for_gene[selected_idx],
+  stringsAsFactors = FALSE
+)
+selected_tbl <- selected_tbl[order(selected_tbl$absKME_own, decreasing = TRUE), ]
+
+write.csv(selected_tbl, file = paste0("kME_ge_", kME_cutoff, "_genes.csv"), row.names = FALSE)
+
+
+## =========================
+## 1) Plot #1: absKME_own 분포 (히스토그램 + cutoff 선)
+## =========================
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+  
+  df1 <- data.frame(absKME_own = absKME_own)
+  p1 <- ggplot(df1, aes(x = absKME_own)) +
+    geom_histogram(bins = 40, na.rm = TRUE) +
+    geom_vline(xintercept = kME_cutoff, linetype = "dashed", linewidth = 1) +
+    labs(
+      title = "Distribution of |kME(own module)|",
+      subtitle = paste0("Cutoff = ", kME_cutoff, "  |  Selected = ", length(selected_genes)),
+      x = "|kME|", y = "Count"
+    ) +
+    theme_minimal(base_size = 13)
+  
+  print(p1)
+  
+} else {
+  hist(absKME_own, breaks = 40, main = "|kME(own module)| distribution",
+       xlab = "|kME|", col = "gray", border = "white")
+  abline(v = kME_cutoff, lty = 2, lwd = 2)
+  mtext(paste0("Cutoff=", kME_cutoff, "  Selected=", length(selected_genes)), side = 3)
+}
+
+
+## =========================
+## 2) Plot #2: ECDF (누적분포) + cutoff에서 남는 비율 표시
+## =========================
+prop_selected <- mean(absKME_own >= kME_cutoff, na.rm = TRUE)
+
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  df2 <- data.frame(absKME_own = absKME_own)
+  p2 <- ggplot(df2, aes(x = absKME_own)) +
+    stat_ecdf(na.rm = TRUE) +
+    geom_vline(xintercept = kME_cutoff, linetype = "dashed", linewidth = 1) +
+    annotate("text", x = kME_cutoff, y = 0.05,
+             label = paste0(">= cutoff: ", round(prop_selected, 3)),
+             hjust = -0.05, vjust = 0, size = 4) +
+    labs(
+      title = "ECDF of |kME| (shows how strict the cutoff is)",
+      x = "|kME|", y = "ECDF"
+    ) +
+    theme_minimal(base_size = 13)
+  
+  print(p2)
+  
+} else {
+  plot(ecdf(absKME_own[!is.na(absKME_own)]),
+       main = "ECDF of |kME|", xlab = "|kME|", ylab = "ECDF")
+  abline(v = kME_cutoff, lty = 2, lwd = 2)
+  legend("topleft", legend = paste0("P(|kME| >= ", kME_cutoff, ") = ", round(prop_selected, 3)),
+         bty = "n")
+}
+
+
+## =========================
+## 3) Plot #3: 모듈별 선택된 유전자 수 (전체 대비)
+## =========================
+tab_all <- table(module_id)
+tab_sel <- table(module_id[selected_idx])
+
+df3 <- data.frame(
+  ModuleID = names(tab_all),
+  All = as.integer(tab_all),
+  Selected = as.integer(tab_sel[names(tab_all)])
+)
+df3$Selected[is.na(df3$Selected)] <- 0
+df3$SelectedRate <- df3$Selected / df3$All
+
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  p3 <- ggplot(df3, aes(x = reorder(ModuleID, Selected))) +
+    geom_col(aes(y = Selected)) +
+    coord_flip() +
+    labs(
+      title = "Selected genes per module (no per-module quota)",
+      subtitle = paste0("|kME| >= ", kME_cutoff),
+      x = "Module", y = "Selected gene count"
+    ) +
+    theme_minimal(base_size = 13)
+  
+  print(p3)
+  
+  # (보너스) 선택 비율도 함께 보고 싶으면
+  p3b <- ggplot(df3, aes(x = reorder(ModuleID, SelectedRate), y = SelectedRate)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = "Selection rate per module",
+      subtitle = paste0("|kME| >= ", kME_cutoff),
+      x = "Module", y = "Selected / All"
+    ) +
+    theme_minimal(base_size = 13)
+  
+  print(p3b)
+  
+} else {
+  barplot(df3$Selected, names.arg = df3$ModuleID, las = 2,
+          main = paste0("Selected genes per module (|kME| >= ", kME_cutoff, ")"),
+          ylab = "Selected count")
+}
+
+
+## =========================
+## 4) Plot #4: |kME| vs kWithin (연결성) 산점도
+##     - "상관이 큰 유전자 = 모듈 중심(허브) 근처인지"를 직관적으로 보여줌
+## =========================
+# kWithin 계산(softPower 필요)
+if (!exists("softPower")) {
+  if (exists("net") && !is.null(net$power)) softPower <- net$power
+}
+
+if (exists("softPower")) {
+  adj <- WGCNA::adjacency(datExpr, power = softPower, type = "signed")
+  IMC <- WGCNA::intramodularConnectivity(adj, colors = moduleColors, scaleByMax = TRUE)
+  kWithin <- IMC$kWithin
+  
+  df4 <- data.frame(
+    GeneSymbol = colnames(datExpr),
+    absKME_own = absKME_own,
+    kWithin = kWithin,
+    Selected = (absKME_own >= kME_cutoff),
+    ModuleID = module_id,
+    stringsAsFactors = FALSE
+  )
+  
+  if (requireNamespace("ggplot2", quietly = TRUE)) {
+    p4 <- ggplot(df4, aes(x = kWithin, y = absKME_own)) +
+      geom_point(alpha = 0.6, na.rm = TRUE) +
+      geom_hline(yintercept = kME_cutoff, linetype = "dashed", linewidth = 1) +
+      labs(
+        title = "|kME| vs intramodular connectivity (kWithin)",
+        subtitle = "If selection is meaningful, selected genes tend to have higher kWithin (more hub-like).",
+        x = "kWithin (scaled)", y = "|kME(own module)|"
+      ) +
+      theme_minimal(base_size = 13)
+    
+    print(p4)
+  } else {
+    plot(kWithin, absKME_own, pch = 16, col = "gray",
+         xlab = "kWithin (scaled)", ylab = "|kME|",
+         main = "|kME| vs kWithin")
+    abline(h = kME_cutoff, lty = 2, lwd = 2)
+  }
+} else {
+  cat("softPower를 찾지 못해서 Plot #4(|kME| vs kWithin)은 건너뛰었어요.\n",
+      "softPower 값을 알려주면 이 플롯도 그릴 수 있어요.\n", sep="")
+}
+##더 다채롭게
+library(ggplot2)
+
+df1 <- data.frame(
+  absKME_own = absKME_own,
+  Selected = absKME_own >= kME_cutoff
+)
+
+p1 <- ggplot(df1, aes(x = absKME_own, fill = Selected)) +
+  geom_histogram(bins = 40, alpha = 0.8, position = "identity") +
+  geom_vline(xintercept = kME_cutoff, linetype = "dashed", linewidth = 1.2) +
+  scale_fill_manual(values = c("FALSE" = "#B0BEC5", "TRUE" = "#E53935")) +
+  labs(
+    title = "|kME| distribution with selected genes highlighted",
+    subtitle = paste0("Cutoff = ", kME_cutoff,
+                      " | Selected = ", sum(df1$Selected)),
+    x = "|kME|", y = "Gene count",
+    fill = "Selected"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(p1)
+
+##플롯2
+df2 <- data.frame(absKME_own = absKME_own)
+
+p2 <- ggplot(df2, aes(x = absKME_own)) +
+  stat_ecdf(geom = "step", linewidth = 1, color = "#1E88E5") +
+  geom_vline(xintercept = kME_cutoff, linetype = "dashed",
+             linewidth = 1.2, color = "#E53935") +
+  annotate("text",
+           x = kME_cutoff, y = 0.05,
+           label = paste0("Top ",
+                          round(mean(absKME_own >= kME_cutoff, na.rm=TRUE)*100,1),
+                          "%"),
+           color = "#E53935", hjust = -0.05, size = 4) +
+  labs(
+    title = "ECDF of |kME|",
+    subtitle = "kME = 0.75",
+    x = "|kME|", y = "Cumulative proportion"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(p2)
+
+##플롯3
+df3 <- data.frame(
+  Module = names(tab_all),
+  All = as.integer(tab_all),
+  Selected = as.integer(tab_sel[names(tab_all)])
+)
+df3$Selected[is.na(df3$Selected)] <- 0
+
+# 모듈 색을 실제 WGCNA 색으로 사용
+df3$Color <- df3$Module
+
+p3 <- ggplot(df3,
+             aes(x = reorder(Module, Selected),
+                 y = Selected,
+                 fill = Color)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_identity() +
+  labs(
+    title = "Selected genes per module",
+    subtitle = paste0("|kME| ≥ ", kME_cutoff),
+    x = "Module", y = "Selected gene count"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(p3)
+
+##플롯4
+suppressPackageStartupMessages({
+  library(WGCNA)
+})
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+
+## 0) softPower 확보
+if (!exists("softPower")) {
+  if (exists("net") && !is.null(net$power)) {
+    softPower <- net$power
+  } else {
+    stop("softPower가 없어요. WGCNA에서 선택한 softPower 값을 softPower <- <값>으로 넣어줘.")
+  }
+}
+
+## 1) datExpr 점검: samples x genes
+stopifnot(exists("datExpr"), exists("moduleColors"))
+stopifnot(length(moduleColors) == ncol(datExpr))
+
+## 2) adjacency 계산 (signed network 기준)
+adj <- WGCNA::adjacency(datExpr, power = softPower, type = "signed")
+
+## 3) intramodular connectivity 계산
+IMC <- WGCNA::intramodularConnectivity(adj, colors = moduleColors, scaleByMax = TRUE)
+
+## 4) kWithin 추출
+kWithin <- IMC$kWithin
+names(kWithin) <- colnames(datExpr)  # 유전자 이름 붙이기
+
+## 확인
+summary(kWithin)
+head(sort(kWithin, decreasing = TRUE), 10)  # top hub-like genes
+
+df4 <- data.frame(
+  absKME_own = absKME_own,
+  kWithin = kWithin,
+  Module = module_id,
+  Selected = absKME_own >= kME_cutoff
+)
+
+p4 <- ggplot(df4,
+             aes(x = kWithin,
+                 y = absKME_own,
+                 color = Module,
+                 size = Selected)) +
+  geom_point(alpha = 0.8) +
+  geom_hline(yintercept = kME_cutoff,
+             linetype = "dashed",
+             linewidth = 1.2,
+             color = "black") +
+  scale_size_manual(values = c("FALSE" = 1.5, "TRUE" = 3)) +
+  labs(
+    title = "|kME| vs kWithin (hub structure)",
+    subtitle = "Selected genes are larger & above dashed line",
+    x = "Intramodular connectivity (kWithin)",
+    y = "|kME|",
+    size = "Selected"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(p4)
+
