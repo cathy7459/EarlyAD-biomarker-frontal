@@ -1,0 +1,15 @@
+# 01_load_core_genes.R
+state$core_genes <- NULL
+
+if (!is.null(CFG$core_gene_csv) && file.exists(CFG$core_gene_csv)) {
+  core_dt <- fread(CFG$core_gene_csv)
+  gene_col <- names(core_dt)[match(TRUE, tolower(names(core_dt)) %in% c("genesymbol","gene","symbol","hgnc_symbol","gene_symbol"))]
+  if (is.na(gene_col)) gene_col <- names(core_dt)[1]
+
+  core_genes <- unique(trimws(as.character(core_dt[[gene_col]])))
+  core_genes <- core_genes[!is.na(core_genes) & core_genes != ""]
+  state$core_genes <- core_genes
+  log_msg("[Core] loaded ", length(core_genes), " genes from ", CFG$core_gene_csv, " (col=", gene_col, ")")
+} else {
+  log_msg("[Core] core gene file not found -> proceeding WITHOUT core filtering (not recommended). path=", CFG$core_gene_csv)
+}
