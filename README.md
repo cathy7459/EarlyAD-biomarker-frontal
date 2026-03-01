@@ -124,3 +124,58 @@ If you want, I can also:
 - add `renv` to lock package versions for full reproducibility
 g README.md…]()
 
+#LASSO
+[README.md](https://github.com/user-attachments/files/25659777/README.md)
+# LASSO pipeline (GSE33000) — paper-ready scaffold
+
+This repository contains a **reproducible** (paper-style) pipeline to:
+
+1) build a **gene × sample** expression matrix for **GSE33000** from the GEO series matrix  
+2) map probes → gene symbols (GPL4372) and **collapse multiple probes per gene**  
+3) run **effect-size filtering** (limma; |logFC| + FDR) to define a stable feature set  
+4) train a **binomial LASSO** model (glmnet) and (optionally) validate on another GEO dataset
+
+> Raw data are not stored in this repository. Place downloaded files under `data/raw/`.
+
+## Quick start
+
+### 0) Requirements
+- R >= 4.2
+- Packages: `data.table`, `GEOquery`, `limma`, `glmnet`, `pROC`
+
+### 1) Put inputs in place
+Create folders locally (they are gitignored):
+- `data/raw/`  
+- `data/processed/`  
+- `outputs/`
+
+Place:
+- `data/raw/GSE33000_series_matrix.txt.gz`
+- (optional) a validation series matrix: e.g. `data/raw/GSE44770_series_matrix.txt.gz`
+- a core gene list CSV: `data/processed/core_genes.csv` with a column **GeneSymbol**
+
+If you **cannot** reliably infer case/control labels from GEO metadata, create:
+- `data/processed/sample_metadata_gse33000.csv` with columns:
+  - `sample_id` (e.g., GSMxxxxxxx matching series matrix columns)
+  - `condition` (values: `AD` or `Control`)
+
+### 2) Run everything
+From the repo root:
+```bash
+Rscript scripts/run_all.R
+```
+
+## Outputs
+- `data/processed/gse33000_expr_gene_x_sample.csv`
+- `outputs/tables/deg_gse33000.csv`
+- `outputs/tables/deg_filtered_genes.csv`
+- `outputs/tables/lasso_selected_genes.csv`
+- `outputs/figures/roc_train.png` (+ optional validation ROC)
+
+## Reproducibility notes
+- All file paths and thresholds are centralized in `config/config.R`.
+- The pipeline is split into small scripts under `scripts/` and reusable functions under `R/`.
+
+## Original script
+See `original/LASSO with gse33000_1.R` for the unrefactored source.
+
