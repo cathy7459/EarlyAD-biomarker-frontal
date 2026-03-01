@@ -1,4 +1,4 @@
-# EarlyAD-biomarker-PCA-WGCNA
+[README.md](https://github.com/user-attachments/files/25644238/README.md)# EarlyAD-biomarker-PCA-WGCNA
 Reproducible transcriptomic pipeline for early AD biomarker discovery using PCA expansion and WGCNA.
 #PCGS README
 [README.md](https://github.com/user-attachments/files/25642571/README.md)
@@ -67,3 +67,60 @@ Outputs are written to `outputs/`.
 
 - Region matching uses a regex (`frontal|pfc|prefrontal|dlpfc|dorsolateral`). If your `pData` uses different naming, change `frontal_regex`.
 - The pipeline keeps logic explicit and avoids overwriting objects in-place (one of the biggest readability issues in the original script).
+
+# PCA and WGCNA
+#[Uploadin# GSE118553 PCA expansion + WGCNA (cleaned)
+
+This repository is a cleaned, GitHub-friendly refactor of your original script:
+`original/PCA_expansion_and_WGCNA_gse118553.R`.
+
+## What this repo does
+1. **PCA expansion**: starting from a *core gene set*, it expands to a capped gene set (default 800) using:
+   - simple correlations to selected PCs
+   - partial correlations (PCk controlling other PCs)
+   - AND filter across ≥ `m` PCs, then hard-cap by a combined score
+
+2. **WGCNA**: runs a signed WGCNA on the (expanded) gene set and saves:
+   - gene → module mapping
+   - module eigengenes
+   - a bundled RDS of the full results
+
+## What you must provide upstream
+This repo intentionally **does not** re-download GEO data (so it's fast and modular).
+Before running, create these objects in your environment:
+
+- `expr_mapped` : probe-level expression matrix (probes x samples)
+- `map_df`      : mapping table with column `symbol` (gene symbol) aligned to `expr_mapped` rows
+- `expr_gene`   : **core gene** expression matrix (genes x samples), used to fix sample order
+- `core_features` : character vector of core gene symbols
+- (optional) `group_f` : labels for each sample (names must be sample IDs)
+
+## Run
+After your preprocessing script has created the objects above:
+
+```r
+source("scripts/run_all.R")
+```
+
+Outputs are written to `outputs/`.
+
+## Outputs
+- `outputs/expanded_genes.txt`
+- `outputs/expanded_expression_gene_x_sample.csv`
+- `outputs/pca_expansion_diagnostics.rds`
+- `outputs/WGCNA_GeneModuleMap.csv`
+- `outputs/WGCNA_ModuleEigengenes.csv`
+- `outputs/WGCNA_results.rds`
+- (optional) `outputs/WGCNA_ME_trait_correlation.tsv` (+ pvalues)
+
+## Tuning
+Edit parameters at the top of `scripts/01_pca_expansion.R` and `scripts/02_wgcna.R`:
+- PCA expansion: `K_fixed`, `drop_PC1`, `m_and`, `target_max`
+- WGCNA: `minModuleSize`, `mergeCutHeight`, `networkType`
+
+---
+If you want, I can also:
+- add `optparse` CLI (`--target_max 800` etc.)
+- add `renv` to lock package versions for full reproducibility
+g README.md…]()
+
