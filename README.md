@@ -1,4 +1,4 @@
-[README.md](https://github.com/user-attachments/files/25644238/README.md)# EarlyAD-biomarker-PCA-WGCNA
+[README.md](https://github.com/user-attachments/files/25660043/README.md)[README.md](https://github.com/user-attachments/files/25644238/README.md)# EarlyAD-biomarker-PCA-WGCNA
 Reproducible transcriptomic pipeline for early AD biomarker discovery using PCA expansion and WGCNA.
 #PCGS README
 [README.md](https://github.com/user-attachments/files/25642571/README.md)
@@ -178,4 +178,44 @@ Rscript scripts/run_all.R
 
 ## Original script
 See `original/LASSO with gse33000_1.R` for the unrefactored source.
+
+#LASSO TEST
+[Uploa# GSE33000 → LASSO (train) → GSE122063 (test)
+
+Paper-ready, reproducible R pipeline for training a LASSO logistic regression model on **GSE33000** and evaluating on **GSE122063**.
+
+## What this repo does
+1. **TRAIN (GSE33000)**: parse `series_matrix.txt.gz` → probe→gene mapping with **GPL4372** → gene-level collapse (max variance probe) → label AD/Control (exclude HD).
+2. **TEST (GSE122063)**: `getGEO()` → platform mapping → gene-level collapse (max variance probe) → label AD/Control (exclude vascular dementia).
+3. **MODEL**: z-score standardization using **train** mean/sd → `cv.glmnet(family="binomial")` → ROC/AUC on train & test → selected genes.
+
+## Inputs (NOT stored in git)
+Place these locally (see `.gitignore`):
+- `data/raw/GSE33000_series_matrix.txt.gz`
+- (optional) `data/processed/core_genes.csv`  (any of these columns accepted: `GeneSymbol`, `gene`, `symbol`, `hgnc_symbol`, `gene_symbol`)
+
+## Configure
+Edit:
+- `config/config.R`
+
+## Run
+From repo root:
+```bash
+Rscript scripts/run_all.R
+```
+
+## Outputs
+Saved to `outputs/`:
+- `outputs/tables/*_selected_genes.csv`
+- `outputs/tables/*_all_coefficients.csv`
+- `outputs/tables/*_performance.csv`
+- `outputs/figures/*_roc_train.png`
+- `outputs/figures/*_roc_test.png`
+- `outputs/figures/*_coef_path.png`
+- `outputs/*_model_bundle.rds`
+
+## Provenance
+The original single-file script is preserved in `original/`.
+ding README.md…]()
+
 
