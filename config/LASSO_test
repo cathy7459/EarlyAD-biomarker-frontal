@@ -1,0 +1,24 @@
+# ============================
+# Configuration (edit this)
+# ============================
+CFG <- list(
+  # --- TRAIN (GSE33000) ---
+  train_series_matrix_gz = "data/raw/GSE33000_series_matrix.txt.gz",
+  train_platform_id      = "GPL4372",
+
+  # --- CORE gene set (optional) ---
+  core_gene_csv          = "data/processed/core_genes.csv",
+
+  # --- TEST (GSE122063) ---
+  test_gse_id            = "GSE122063",
+  test_diag_col          = "patient diagnosis:ch1",
+
+  # --- MODEL ---
+  alpha                  = 1.0,     # 1=LASSO, 0=Ridge
+  nfolds                 = 10,
+  lambda_choice          = "lambda.1se",  # "lambda.min" or "lambda.1se"
+
+  # --- Output ---
+  out_dir                = "outputs",
+  prefix                 = "trainGSE33000_testGSE122063"
+)
