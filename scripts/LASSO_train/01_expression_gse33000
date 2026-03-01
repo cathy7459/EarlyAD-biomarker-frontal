@@ -1,0 +1,56 @@
+source("scripts/00_setup.R")
+
+log_msg("[1/3] Reading core gene list: ", CORE_GENES_CSV)
+core <- fread(CORE_GENES_CSV)
+stopifnot("GeneSymbol" %in% names(core))
+core_genes <- unique(core$GeneSymbol)
+core_genes <- core_genes[!is.na(core_genes) & core_genes != ""]
+log_msg("Core genes: ", length(core_genes))
+
+log_msg("[1/3] Reading GSE33000 series matrix table: ", GSE33000_SERIES_MATRIX_GZ)
+expr_dt <- read_series_matrix_table(GSE33000_SERIES_MATRIX_GZ)
+stopifnot("ID_REF" %in% names(expr_dt))
+expr_dt[, ID_REF := as.character(ID_REF)]
+
+log_msg("[1/3] Downloading/reading platform annotation: ", GPL_ID)
+gpl_tab <- get_gpl_annotation(GPL_ID)
+
+sym_col_candidates <- c("Gene Symbol", "Gene symbol", "GENE_SYMBOL", "Symbol", "SYMBOL", "gene_assignment")
+id_col_candidates  <- c("ID", "ID_REF", "Probe", "PROBE_ID", "probe_id")
+
+sym_col <- pick_col(colnames(gpl_tab), sym_col_candidates)
+id_col  <- pick_col(colnames(gpl_tab), id_col_candidates)
+if (is.na(sym_col) || is.na(id_col)) {
+  stop("Failed to locate ID/Symbol columns in GPL table. Please inspect GPL columns and update candidates.")
+}
+
+anno <- gpl_tab[, .(ID_REF = as.character(get(id_col)),
+                   GeneSymbol = as.character(get(sym_col)))]
+
+# Clean GeneSymbol (some GPLs store multiple symbols per probe)
+anno[, GeneSymbol := sub("///.*$", "", GeneSymbol)]
+anno[, GeneSymbol := trimws(GeneSymbol)]
+anno <- anno[!is.na(ID_REF) & ID_REF != "" & !is.na(GeneSymbol) & GeneSymbol != ""]
+
+log_msg("[1/3] Merging expression with annotation ...")
+m <- merge(anno, expr_dt, by = "ID_REF", all = FALSE)
+log_msg("Merged rows: ", nrow(m))
+
+m_core <- m[GeneSymbol %in% core_genes]
+log_msg("Core-mapped rows: ", nrow(m_core))
+log_msg("Observed core genes: ", length(unique(m_core$GeneSymbol)))
+
+sample_cols <- setdiff(colnames(m_core), c("ID_REF", "GeneSymbol"))
+log_msg("[1/3] Collapsing probes per gene (max-variance probe) ...")
+m_best <- collapse_probes_by_maxvar(m_core, gene_col = "GeneSymbol", sample_cols = sample_cols)
+
+expr_gene <- to_gene_x_sample(m_best, gene_col = "GeneSymbol", sample_cols = sample_cols)
+
+out_expr <- file.path(DIR_DATA_PROCESSED, "gse33000_expr_gene_x_sample.csv")
+out_map  <- file.path(DIR_DATA_PROCESSED, "gse33000_probe_mapping_used.csv")
+
+fwrite(as.data.table(expr_gene, keep.rownames = "GeneSymbol"), out_expr)
+fwrite(m_best[, .(GeneSymbol, ID_REF, probe_var)], out_map)
+
+log_msg("Saved: ", out_expr)
+log_msg("Saved: ", out_map)
