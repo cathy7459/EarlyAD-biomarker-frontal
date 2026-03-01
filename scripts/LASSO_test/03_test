@@ -1,0 +1,62 @@
+# 03_test_gse122063.R
+log_msg("=== TEST: ", CFG$test_gse_id, " ===")
+
+gse_obj <- getGEO(CFG$test_gse_id, GSEMatrix = TRUE)
+if (length(gse_obj) > 1) {
+  # choose the first by default; user can change if needed
+  log_msg("[Test] multiple ExpressionSets found: ", length(gse_obj), " -> using first. If wrong, edit scripts/03_test_gse122063.R")
+  eset <- gse_obj[[1]]
+} else {
+  eset <- gse_obj[[1]]
+}
+
+expr_probe <- exprs(eset)  # probes x samples
+test_samples <- colnames(expr_probe)
+
+# phenotype
+ph <- pData(eset)
+if (!(CFG$test_diag_col %in% colnames(ph))) {
+  # try case-insensitive match
+  hit <- colnames(ph)[tolower(colnames(ph)) == tolower(CFG$test_diag_col)]
+  if (length(hit) == 1) {
+    CFG$test_diag_col <- hit
+  } else {
+    stop("Test diagnosis column not found in pData. Wanted: ", CFG$test_diag_col, " . Available: ", paste(colnames(ph), collapse=", "))
+  }
+}
+
+diag_raw <- as.character(ph[[CFG$test_diag_col]])
+diag_lc <- tolower(diag_raw)
+
+# Exclude vascular dementia; keep AD/Control
+is_vascular <- grepl("vascular", diag_lc)
+is_ad <- grepl("alzheimer|ad", diag_lc) & !is_vascular
+is_ctrl <- grepl("control|normal|healthy", diag_lc) & !is_vascular
+
+keep <- which(is_ad | is_ctrl)
+if (length(keep) < 10) stop("Too few labeled samples in test after filtering AD/Control. Check diagnosis parsing.")
+
+state$test_samples <- test_samples[keep]
+state$y_test_chr <- ifelse(is_ad[keep], "AD", "Control")
+state$y_test <- ifelse(state$y_test_chr == "AD", 1, 0)
+
+expr_probe_sub <- expr_probe[, state$test_samples, drop=FALSE]
+
+# platform mapping for test set
+platform_id <- annotation(eset)
+if (is.null(platform_id) || platform_id == "") {
+  # fallback: try from metadata
+  platform_id <- as.character(experimentData(eset)@annotation)
+}
+if (is.null(platform_id) || platform_id == "") stop("Cannot determine platform ID for test ExpressionSet.")
+
+log_msg("[Test] platform detected: ", platform_id)
+
+test_anno <- get_probe_gene_mapping(platform_id)
+
+# collapse to gene
+test_collapsed <- collapse_to_gene_maxvar(expr_probe_sub, test_anno, keep_genes = state$core_genes)
+state$test_gene_mat_gxs <- test_collapsed$expr_gene
+log_msg("[Test] gene-matrix: ", nrow(state$test_gene_mat_gxs), " genes x ", ncol(state$test_gene_mat_gxs), " samples")
+
+log_msg("[Test] final labeled samples: ", length(state$test_samples), " (AD=", sum(state$y_test==1), ", Control=", sum(state$y_test==0), ")")
