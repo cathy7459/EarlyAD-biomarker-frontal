@@ -1,0 +1,51 @@
+# 02_train_gse33000.R
+log_msg("=== TRAIN: GSE33000 ===")
+
+if (!file.exists(CFG$train_series_matrix_gz)) {
+  stop("Train series matrix not found: ", CFG$train_series_matrix_gz)
+}
+
+train_dt <- read_series_matrix_table(CFG$train_series_matrix_gz)
+
+# Probe x Sample numeric matrix
+train_samples <- setdiff(names(train_dt), "ID_REF")
+train_probe_mat <- as.matrix(train_dt[, ..train_samples])
+rownames(train_probe_mat) <- train_dt$ID_REF
+storage.mode(train_probe_mat) <- "numeric"
+log_msg("[Train] probe-matrix: ", nrow(train_probe_mat), " probes x ", ncol(train_probe_mat), " samples")
+
+# probe -> gene mapping (GPL4372)
+train_anno <- get_probe_gene_mapping(CFG$train_platform_id)
+
+# collapse to gene (genes x samples) + optional core filter
+train_collapsed <- collapse_to_gene_maxvar(train_probe_mat, train_anno, keep_genes = state$core_genes)
+state$train_gene_mat_gxs <- train_collapsed$expr_gene
+state$train_best_map <- train_collapsed$best_map
+log_msg("[Train] gene-matrix: ", nrow(state$train_gene_mat_gxs), " genes x ", ncol(state$train_gene_mat_gxs), " samples")
+
+# labels from series meta
+train_meta <- parse_series_matrix_sample_meta(CFG$train_series_matrix_gz)
+train_lab  <- make_labels_gse33000(train_meta)
+
+# keep AD/Control only (exclude HD)
+keep_idx <- which(train_lab$y %in% c("AD","Control"))
+if (length(keep_idx) < 10) stop("Too few labeled samples in train after filtering AD/Control. Check metadata parsing.")
+
+state$train_samples <- train_lab$sample_id[keep_idx]
+state$y_train_chr <- train_lab$y[keep_idx]
+state$y_train <- ifelse(state$y_train_chr == "AD", 1, 0)
+
+# subset expression to labeled samples
+common_train_samples <- intersect(colnames(state$train_gene_mat_gxs), state$train_samples)
+if (length(common_train_samples) != length(state$train_samples)) {
+  log_msg("[Train] WARN: some labeled samples not found in expression matrix. using intersection: ", length(common_train_samples))
+  state$train_samples <- common_train_samples
+  # align y
+  y_map <- data.table(sample_id=train_lab$sample_id[keep_idx], y=train_lab$y[keep_idx])
+  y_map <- y_map[sample_id %in% common_train_samples]
+  state$y_train_chr <- y_map$y
+  state$y_train <- ifelse(state$y_train_chr=="AD",1,0)
+}
+state$train_gene_mat_gxs <- state$train_gene_mat_gxs[, state$train_samples, drop=FALSE]
+
+log_msg("[Train] final labeled samples: ", length(state$train_samples), " (AD=", sum(state$y_train==1), ", Control=", sum(state$y_train==0), ")")
