@@ -1,0 +1,143 @@
+#!/usr/bin/env Rscript
+# 02_wgcna.R ----
+# Run WGCNA on an (expanded) gene x sample matrix.
+#
+# Inputs (objects expected BEFORE sourcing/running):
+#   - expr_gene : gene x sample numeric matrix (expanded or not)
+#   - group_f   : (optional) factor/character vector of sample labels (names = sample IDs)
+#
+# Outputs (written to outputs/ by default):
+#   - WGCNA_GeneModuleMap.csv
+#   - WGCNA_ModuleEigengenes.csv
+#   - WGCNA_results.rds
+#   - (optional) WGCNA_ME_trait_correlation.tsv + pvalues
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+})
+
+source(file.path("R", "utils.R"))
+
+log_step("WGCNA | input check")
+require_objects(c("expr_gene"))
+
+# Normalize input shape
+if (is.data.frame(expr_gene) && "GeneSymbol" %in% colnames(expr_gene)) {
+  rownames(expr_gene) <- expr_gene$GeneSymbol
+  expr_gene$GeneSymbol <- NULL
+  expr_gene <- as.matrix(expr_gene)
+}
+expr_gene <- as_numeric_matrix(expr_gene)
+if (is.null(rownames(expr_gene)) || anyNA(rownames(expr_gene))) stop("expr_gene must have valid rownames (gene symbols).")
+if (is.null(colnames(expr_gene)) || anyNA(colnames(expr_gene))) stop("expr_gene must have valid colnames (sample IDs).")
+
+# WGCNA expects samples x genes
+datExpr <- t(expr_gene)
+
+options(stringsAsFactors = FALSE)
+allowWGCNAThreads()
+
+gsg <- goodSamplesGenes(datExpr, verbose = 3)
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0) cat("Removing genes:", paste(colnames(datExpr)[!gsg$goodGenes], collapse = ", "), "\n")
+  if (sum(!gsg$goodSamples) > 0) cat("Removing samples:", paste(rownames(datExpr)[!gsg$goodSamples], collapse = ", "), "\n")
+  datExpr <- datExpr[gsg$goodSamples, gsg$goodGenes]
+}
+
+# --- 1) Soft-threshold power selection
+log_step("WGCNA | pick soft-threshold power")
+powers <- 1:20
+sft <- pickSoftThreshold(datExpr, powerVector = powers, networkType = "signed", verbose = 5)
+
+fitTbl <- sft$fitIndices
+candidate <- fitTbl$Power[which(fitTbl$SFT.R.sq >= 0.80)]
+softPower <- if (length(candidate) > 0) min(candidate) else fitTbl$Power[which.max(fitTbl$SFT.R.sq)]
+cat("Chosen softPower =", softPower, "\n")
+
+# --- 2) Module detection
+log_step("WGCNA | blockwiseModules")
+net <- blockwiseModules(
+  datExpr,
+  power = softPower,
+  networkType = "signed",
+  TOMType = "signed",
+  minModuleSize = 30,
+  reassignThreshold = 0,
+  mergeCutHeight = 0.25,
+  numericLabels = TRUE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = file.path("outputs", "TOM"),
+  verbose = 3
+)
+
+moduleLabels <- net$colors
+moduleColors <- labels2colors(moduleLabels)
+cat("Module counts:\n")
+print(table(moduleColors))
+
+# --- 3) Module eigengenes
+log_step("WGCNA | module eigengenes")
+MEs0 <- moduleEigengenes(datExpr, colors = moduleColors)$eigengenes
+MEs  <- orderMEs(MEs0)
+cat("MEs dim:", nrow(MEs), "samples x", ncol(MEs), "modules\n")
+
+# --- 4) Optional: trait correlation
+out_dir <- "outputs"
+if (exists("group_f")) {
+  log_step("WGCNA | trait correlation (optional)")
+  # If group_f is named, align to datExpr rownames (sample IDs)
+  if (!is.null(names(group_f))) {
+    common <- intersect(rownames(datExpr), names(group_f))
+    if (length(common) >= 5) {
+      datExpr2 <- datExpr[common, , drop = FALSE]
+      MEs2     <- MEs[common, , drop = FALSE]
+      group2   <- group_f[common]
+    } else {
+      warning("group_f names do not match datExpr rownames well; skipping trait correlation.")
+      datExpr2 <- NULL
+    }
+  } else {
+    # assume order already matches
+    group2 <- group_f
+    datExpr2 <- datExpr
+    MEs2 <- MEs
+  }
+
+  if (!is.null(datExpr2)) {
+    trait <- data.frame(
+      Control = as.numeric(group2 == "Control"),
+      AsymAD  = as.numeric(group2 == "AsymAD"),
+      AD      = as.numeric(group2 == "AD")
+    )
+    rownames(trait) <- rownames(datExpr2)
+
+    modTraitCor <- cor(MEs2, trait, use = "pairwise.complete.obs")
+    modTraitP   <- corPvalueStudent(modTraitCor, nSamples = nrow(datExpr2))
+
+    write_tsv(modTraitCor, file.path(out_dir, "WGCNA_ME_trait_correlation.tsv"))
+    write_tsv(modTraitP,   file.path(out_dir, "WGCNA_ME_trait_correlation_pvalues.tsv"))
+  }
+}
+
+# --- 5) Save mapping + MEs + RDS bundle
+log_step("WGCNA | save outputs")
+geneModule <- data.frame(
+  GeneSymbol  = colnames(datExpr),
+  ModuleColor = moduleColors,
+  ModuleLabel = moduleLabels,
+  stringsAsFactors = FALSE
+)
+
+write_csv(geneModule, file.path(out_dir, "WGCNA_GeneModuleMap.csv"))
+write_csv(data.frame(Sample = rownames(MEs), MEs, check.names = FALSE),
+          file.path(out_dir, "WGCNA_ModuleEigengenes.csv"))
+
+saveRDS(
+  list(expr_gene = expr_gene, datExpr = datExpr, net = net,
+       moduleColors = moduleColors, moduleLabels = moduleLabels,
+       MEs = MEs, geneModule = geneModule, softPower = softPower, sft = sft),
+  file = file.path(out_dir, "WGCNA_results.rds")
+)
+
+log_step("WGCNA | done")
