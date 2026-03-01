@@ -1,0 +1,46 @@
+source("scripts/00_setup.R")
+
+expr_path <- file.path(DIR_DATA_PROCESSED, "gse33000_expr_gene_x_sample.csv")
+if (!file.exists(expr_path)) stop("Run scripts/01_build_expr_gse33000.R first: missing ", expr_path)
+
+log_msg("[2/3] Loading expression: ", expr_path)
+expr_dt <- fread(expr_path)
+stopifnot("GeneSymbol" %in% names(expr_dt))
+expr <- as.data.frame(expr_dt[, -1])
+rownames(expr) <- expr_dt$GeneSymbol
+
+# ---- sample metadata ----
+if (!file.exists(GSE33000_SAMPLE_META_CSV)) {
+  stop(
+    "Sample metadata file not found: ", GSE33000_SAMPLE_META_CSV, "\n",
+    "Create it with columns: sample_id, condition (AD/Control).\n",
+    "Tip: sample_id should match expression column names exactly."
+  )
+}
+meta <- fread(GSE33000_SAMPLE_META_CSV)
+meta <- as.data.frame(meta)
+
+# Ensure order matches expression
+meta <- meta[match(colnames(expr), meta$sample_id), , drop = FALSE]
+if (anyNA(meta$sample_id)) stop("sample_metadata does not match expression columns.")
+
+log_msg("[2/3] Running limma DEG ...")
+deg <- run_limma_deg(expr, meta, condition_col = "condition")
+
+out_deg <- file.path(DIR_OUT_TABLES, "deg_gse33000.csv")
+fwrite(deg, out_deg)
+log_msg("Saved: ", out_deg)
+
+# Effect-size filtering
+deg_f <- deg[adj.P.Val < FDR_CUTOFF & abs(logFC) > LOGFC_CUTOFF]
+out_deg_f <- file.path(DIR_OUT_TABLES, "deg_filtered_genes.csv")
+fwrite(deg_f, out_deg_f)
+log_msg("Saved: ", out_deg_f)
+
+# Save filtered expression matrix for modeling
+keep <- intersect(rownames(expr), deg_f$GeneSymbol)
+expr_f <- expr[keep, , drop = FALSE]
+out_expr_f <- file.path(DIR_DATA_PROCESSED, "gse33000_expr_filtered_gene_x_sample.csv")
+fwrite(as.data.table(expr_f, keep.rownames = "GeneSymbol"), out_expr_f)
+log_msg("Saved: ", out_expr_f)
+log_msg("Filtered genes: ", nrow(expr_f))
