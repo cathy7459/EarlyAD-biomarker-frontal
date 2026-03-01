@@ -1,0 +1,47 @@
+source("scripts/00_setup.R")
+
+expr_path <- file.path(DIR_DATA_PROCESSED, "gse33000_expr_filtered_gene_x_sample.csv")
+if (!file.exists(expr_path)) stop("Missing filtered expression: ", expr_path, " (run scripts/02_deg_effect_filter.R)")
+
+meta_path <- GSE33000_SAMPLE_META_CSV
+if (!file.exists(meta_path)) stop("Missing metadata: ", meta_path)
+
+log_msg("[3/3] Loading filtered expression and metadata ...")
+expr_dt <- fread(expr_path)
+expr <- as.data.frame(expr_dt[, -1])
+rownames(expr) <- expr_dt$GeneSymbol
+
+meta <- as.data.frame(fread(meta_path))
+meta <- meta[match(colnames(expr), meta$sample_id), , drop = FALSE]
+if (anyNA(meta$sample_id)) stop("Metadata does not match expression columns.")
+
+# X: samples x genes
+X <- t(as.matrix(expr))
+y <- factor(meta$condition)
+if (!all(levels(y) %in% c("AD", "Control"))) {
+  # force to 0/1 in current order if needed
+  y <- factor(y)
+}
+y_bin <- ifelse(y == "AD", 1, 0)
+
+log_msg("[3/3] Training LASSO (glmnet) ...")
+fit <- train_lasso(X, y_bin, cv_folds = CV_FOLDS, seed = SEED)
+lam <- pick_lambda(fit$cv, USE_LAMBDA)
+
+sel <- selected_genes(fit$cv$glmnet.fit, lam)
+out_sel <- file.path(DIR_OUT_TABLES, "lasso_selected_genes.csv")
+fwrite(sel, out_sel)
+log_msg("Saved: ", out_sel)
+
+# Train ROC
+prob_train <- as.numeric(predict(fit$cv, newx = X, s = lam, type = "response"))
+roc_out <- roc_plot_to_file(prob_train, y_bin, file.path(DIR_OUT_FIGURES, "roc_train.png"))
+log_msg("Train AUC: ", sprintf("%.3f", roc_out$auc))
+
+# Optional validation
+if (!is.null(VALID_SERIES_MATRIX_GZ) && file.exists(VALID_SERIES_MATRIX_GZ)) {
+  log_msg("Validation series matrix found. NOTE: this scaffold does not auto-map validation yet.")
+  log_msg("If you want validation, add a script to build the validation gene×sample matrix and metadata, then project to selected genes.")
+} else {
+  log_msg("No validation dataset configured/found. Skipping validation.")
+}
