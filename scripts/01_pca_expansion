@@ -1,0 +1,186 @@
+#!/usr/bin/env Rscript
+# 01_pca_expansion.R ----
+# PCA expansion for GSE118553 feature space.
+#
+# Inputs (objects expected to exist in the environment BEFORE sourcing/running):
+#   - expr_mapped : probe-level expression with rownames = probe IDs
+#   - map_df      : data.frame with at least columns: probe_id, symbol (gene symbol)
+#   - expr_gene   : *core* gene expression matrix (genes x samples) used to define PCA sample order
+#   - core_features : character vector of core gene symbols
+#
+# Outputs (written to outputs/ by default):
+#   - expanded_genes.txt
+#   - expanded_expression_gene_x_sample.csv
+#   - pca_expansion_diagnostics.rds
+
+suppressPackageStartupMessages({
+  library(limma)
+})
+
+source(file.path("R", "utils.R"))
+
+log_step("PCA expansion | input check")
+require_objects(c("expr_mapped", "map_df", "expr_gene", "core_features"))
+
+if (!("symbol" %in% colnames(map_df))) stop("map_df must contain a column named 'symbol' (gene symbol).")
+if (is.null(rownames(expr_mapped))) stop("expr_mapped must have rownames = probe IDs.")
+
+# --- 0) Make gene-level matrix from probe-level
+log_step("PCA expansion | probe -> gene collapse (avereps)")
+expr_gene_all <- limma::avereps(expr_mapped, ID = map_df$symbol)
+
+# Align samples to the core matrix sample order (very important)
+expr_gene_all <- expr_gene_all[, colnames(expr_gene), drop = FALSE]
+
+# --- 1) PCA on core genes
+log_step("PCA expansion | PCA on core genes")
+core_features <- unique(core_features)
+core_features <- intersect(core_features, rownames(expr_gene_all))
+if (length(core_features) < 10) stop("Too few core_features found in expr_gene_all after mapping (<10). Check gene symbols.")
+
+X_core <- t(expr_gene_all[core_features, , drop = FALSE])  # samples x core genes
+X_core <- safe_scale(X_core)
+
+pca <- prcomp(X_core, center = TRUE, scale. = TRUE)
+
+# Parameters (edit here if you want)
+K_fixed  <- 4
+drop_PC1 <- TRUE
+m_and    <- 2
+target_max <- 800
+
+use_idx <- seq_len(min(K_fixed, ncol(pca$x)))
+if (drop_PC1) use_idx <- setdiff(use_idx, 1)
+scores <- pca$x[, use_idx, drop = FALSE]  # samples x K_used
+cat("Using PCs:", paste(colnames(scores), collapse = ", "), "\n")
+
+# --- 2) Compute correlations between all genes and PCs
+log_step("PCA expansion | correlation with PCs (simple + partial)")
+
+expr_gene_all <- expr_gene_all[, rownames(scores), drop = FALSE]  # align samples
+X_all <- safe_scale(t(expr_gene_all))  # samples x genes
+
+cor_with_pc <- function(x, y) suppressWarnings(cor(x, y, use = "pairwise.complete.obs"))
+
+# Simple correlations: genes x K
+Cmat <- sapply(seq_len(ncol(scores)), function(k) {
+  apply(X_all, 2, function(g) cor_with_pc(g, scores[, k]))
+})
+Cmat <- as.matrix(Cmat)
+colnames(Cmat) <- colnames(scores)
+rownames(Cmat) <- colnames(X_all)
+
+# Partial correlations: gene vs PCk controlling other PCs
+partial_cor_onegene <- function(g, S) {
+  K <- ncol(S)
+  out <- rep(NA_real_, K)
+  for (k in seq_len(K)) {
+    if (K == 1) {
+      out[k] <- cor_with_pc(g, S[, k])
+    } else {
+      others <- S[, -k, drop = FALSE]
+      rg <- residuals(lm(g ~ others))
+      rk <- residuals(lm(S[, k] ~ others))
+      out[k] <- cor_with_pc(rg, rk)
+    }
+  }
+  out
+}
+PCmat <- t(apply(X_all, 2, partial_cor_onegene, S = scores))
+colnames(PCmat) <- colnames(scores)
+rownames(PCmat) <- colnames(X_all)
+
+# --- 3) Threshold search (keep AND condition >= m PCs for both simple & partial)
+log_step("PCA expansion | threshold search (AND filter)")
+
+grid_p <- seq(0.60, 0.20, by = -0.02)
+grid_s <- seq(0.80, 0.30, by = -0.02)
+
+core_n <- length(core_features)
+
+best <- NULL
+for (thr_p in grid_p) {
+  pass_p <- rowSums(abs(PCmat) >= thr_p, na.rm = TRUE) >= m_and
+  if (sum(pass_p) == 0) next
+
+  for (thr_s in grid_s) {
+    pass_s <- rowSums(abs(Cmat) >= thr_s, na.rm = TRUE) >= m_and
+    keep <- pass_p & pass_s
+
+    nn <- length(union(core_features, rownames(Cmat)[keep]))
+    if (nn > core_n && nn <= target_max) {
+      best <- list(thr_p = thr_p, thr_s = thr_s, nn = nn, keep = keep)
+      break
+    }
+  }
+  if (!is.null(best)) break
+}
+
+# Fallback: pick the closest (avoid 0)
+if (is.null(best)) {
+  best_dist <- Inf
+  for (thr_p in grid_p) {
+    pass_p <- rowSums(abs(PCmat) >= thr_p, na.rm = TRUE) >= m_and
+    if (sum(pass_p) == 0) next
+
+    for (thr_s in grid_s) {
+      pass_s <- rowSums(abs(Cmat) >= thr_s, na.rm = TRUE) >= m_and
+      keep <- pass_p & pass_s
+      nn <- length(union(core_features, rownames(Cmat)[keep]))
+      if (nn <= core_n) next
+
+      dist <- if (nn <= target_max) (target_max - nn) else (nn - target_max)
+      if (dist < best_dist) {
+        best_dist <- dist
+        best <- list(thr_p = thr_p, thr_s = thr_s, nn = nn, keep = keep)
+      }
+    }
+  }
+}
+
+cat("Chosen thresholds: thr_p =", best$thr_p, "thr_s =", best$thr_s, "\n")
+cat("Genes after AND filter (including core union):", best$nn, "\n")
+
+# --- 4) Hard-cap to target_max using a combined score (partial * simple)
+log_step("PCA expansion | hard-cap to target_max genes")
+cand_genes <- rownames(Cmat)[best$keep]
+
+# Score = mean(top m partial) * mean(top m simple)
+score_partial <- apply(abs(PCmat[cand_genes, , drop = FALSE]), 1, function(v) mean(sort(v, decreasing = TRUE)[1:m_and]))
+score_simple  <- apply(abs(Cmat[cand_genes, , drop = FALSE]), 1, function(v) mean(sort(v, decreasing = TRUE)[1:m_and]))
+score <- score_partial * score_simple
+
+ranked <- names(sort(score, decreasing = TRUE))
+ranked <- setdiff(ranked, core_features)
+
+add_n <- max(0, target_max - length(core_features))
+add_genes <- head(ranked, add_n)
+
+expanded_genes <- unique(c(core_features, add_genes))
+expanded_expr  <- expr_gene_all[expanded_genes, , drop = FALSE]
+
+cat("FINAL expanded genes:", length(expanded_genes), "\n")
+cat("expanded_expr dim:", nrow(expanded_expr), "x", ncol(expanded_expr), "\n")
+
+# --- 5) Save outputs
+log_step("PCA expansion | save outputs")
+out_dir <- "outputs"
+write_lines(expanded_genes, file.path(out_dir, "expanded_genes.txt"))
+write_csv(
+  data.frame(GeneSymbol = rownames(expanded_expr), expanded_expr, check.names = FALSE),
+  file.path(out_dir, "expanded_expression_gene_x_sample.csv")
+)
+
+saveRDS(
+  list(
+    params = list(K_fixed = K_fixed, drop_PC1 = drop_PC1, m_and = m_and, target_max = target_max,
+                  thr_p = best$thr_p, thr_s = best$thr_s),
+    pca = pca,
+    scores = scores,
+    Cmat = Cmat,
+    PCmat = PCmat
+  ),
+  file = file.path(out_dir, "pca_expansion_diagnostics.rds")
+)
+
+log_step("PCA expansion | done")
