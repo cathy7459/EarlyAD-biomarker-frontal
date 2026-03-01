@@ -1,0 +1,6 @@
+# run_all.R
+source("scripts/00_setup.R")
+source("scripts/01_load_core_genes.R")
+source("scripts/02_train_gse33000.R")
+source("scripts/03_test_gse122063.R")
+source("scripts/04_fit_lasso_and_report.R")
