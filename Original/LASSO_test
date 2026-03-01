@@ -1,0 +1,526 @@
+# ============================================================
+# Paper-ready single-file pipeline
+#   TRAIN: GSE33000 (series matrix + GPL4372 mapping)
+#   TEST : GSE122063 (getGEO + platform mapping)
+#   MODEL: LASSO logistic regression (cv.glmnet)
+#
+# Notes
+# - This script intentionally keeps EVERYTHING in one file.
+# - It follows the more robust/"정답"-style logic for overlapping parts
+#   (robust column detection, mapping, label parsing, train-standardize-apply).
+# - Raw data are NOT committed to git; provide file paths in CONFIG.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GEOquery)
+  library(glmnet)
+  library(pROC)
+  library(stringr)
+})
+
+# ---------------------------
+# CONFIG (edit here)
+# ---------------------------
+set.seed(20260301)
+
+CFG <- list(
+  # --- TRAIN (GSE33000) ---
+  train_series_matrix_gz = "GSE33000_series_matrix.txt.gz",  # local path
+  train_platform_id      = "GPL4372",
+
+  # --- CORE gene set (optional, but recommended if you are projecting to a hub/core space)
+  # file must contain a gene symbol column (e.g., GeneSymbol)
+  core_gene_csv          = "kME_ge_0.75_genes.csv",
+
+  # --- TEST (GSE122063) ---
+  test_gse_id            = "GSE122063",
+  test_diag_col          = "patient diagnosis:ch1",   # used in your code
+
+  # --- MODEL ---
+  alpha                 = 1.0,     # 1=LASSO, 0=Ridge, between=ElasticNet
+  nfolds                = 10,
+  lambda_choice         = "lambda.1se",  # "lambda.min" or "lambda.1se"
+
+  # --- Output ---
+  out_dir               = "outputs_lasso",
+  prefix                = "trainGSE33000_testGSE122063"
+)
+
+# Create output dirs
+.dir_create <- function(path) if (!dir.exists(path)) dir.create(path, recursive = TRUE)
+.dir_create(CFG$out_dir)
+.dir_create(file.path(CFG$out_dir, "tables"))
+.dir_create(file.path(CFG$out_dir, "figures"))
+.dir_create(file.path(CFG$out_dir, "logs"))
+
+log_file <- file.path(CFG$out_dir, "logs", paste0(CFG$prefix, "_log.txt"))
+log_msg <- function(...) {
+  msg <- paste0(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), " | ", paste(..., collapse = " "))
+  cat(msg, "\n")
+  cat(msg, "\n", file = log_file, append = TRUE)
+}
+
+# ---------------------------
+# Utilities
+# ---------------------------
+pick_col <- function(cols, candidates) {
+  hit <- candidates[candidates %in% cols]
+  if (length(hit) > 0) return(hit[1])
+  # case-insensitive exact match
+  for (cand in candidates) {
+    idx <- which(tolower(cols) == tolower(cand))
+    if (length(idx) > 0) return(cols[idx[1]])
+  }
+  # fuzzy contains match
+  for (cand in candidates) {
+    idx <- grep(tolower(cand), tolower(cols), fixed = TRUE)
+    if (length(idx) > 0) return(cols[idx[1]])
+  }
+  NA_character_
+}
+
+clean_symbol <- function(x) {
+  x <- gsub('"', "", as.character(x))
+  x <- trimws(x)
+  # common separators in GPL tables
+  x <- strsplit(x, " /// |///|//|;|,")[[1]][1]
+  x <- trimws(x)
+  if (is.na(x) || x == "" || x == "---") return(NA_character_)
+  x
+}
+
+read_series_matrix_table <- function(gzfile) {
+  con <- gzfile(gzfile, open = "rt")
+  on.exit(close(con), add = TRUE)
+
+  # Move to begin
+  repeat {
+    line <- readLines(con, n = 1)
+    if (length(line) == 0) stop("!series_matrix_table_begin not found")
+    if (grepl("^!series_matrix_table_begin", line)) break
+  }
+
+  # Header line
+  header <- readLines(con, n = 1)
+  header <- gsub('"', "", header)
+  header <- trimws(strsplit(header, "\t")[[1]])
+
+  # Read until end
+  buf <- character()
+  repeat {
+    x <- readLines(con, n = 5000)
+    if (length(x) == 0) break
+    end <- which(grepl("^!series_matrix_table_end", x))
+    if (length(end) > 0) {
+      buf <- c(buf, x[seq_len(end[1] - 1)])
+      break
+    } else {
+      buf <- c(buf, x)
+    }
+  }
+
+  dt <- fread(text = paste(buf, collapse = "\n"), sep = "\t", header = FALSE, quote = "")
+  setnames(dt, header)
+  if (!("ID_REF" %in% names(dt))) stop("ID_REF column missing after read")
+  dt[, ID_REF := as.character(ID_REF)]
+  dt
+}
+
+parse_series_matrix_sample_meta <- function(gzfile) {
+  con <- gzfile(gzfile, open = "rt")
+  on.exit(close(con), add = TRUE)
+  lines <- readLines(con)
+
+  sample_lines <- lines[grepl("^!Sample_", lines)]
+  if (length(sample_lines) == 0) stop("No !Sample_ lines found in series matrix")
+
+  split_line <- function(line) {
+    parts <- strsplit(line, "\t")[[1]]
+    key <- sub("^!Sample_", "", parts[1])
+    vals <- parts[-1]
+    list(key = key, vals = vals)
+  }
+
+  parsed <- lapply(sample_lines, split_line)
+  keys <- vapply(parsed, `[[`, character(1), "key")
+
+  idx <- which(keys == "geo_accession")
+  if (length(idx) == 0) stop("No !Sample_geo_accession line found")
+  gsm <- parsed[[idx[1]]]$vals
+
+  meta <- data.table(GSM = gsm)
+  for (item in parsed) {
+    if (length(item$vals) == length(gsm)) meta[[item$key]] <- item$vals
+  }
+  meta
+}
+
+get_probe_gene_mapping <- function(platform_id) {
+  gpl_obj <- getGEO(platform_id, AnnotGPL = TRUE)
+  gpl_tab <- as.data.table(Table(gpl_obj))
+
+  # Some GPL tables are weird (header is first row). Detect and fix.
+  row1 <- as.character(unlist(gpl_tab[1, ], use.names = FALSE))
+  row1_lc <- tolower(row1)
+  looks_like_header <- any(grepl("^id$|id_ref|probe", row1_lc)) && any(grepl("symbol|gene", row1_lc))
+  if (looks_like_header) {
+    setnames(gpl_tab, make.names(row1, unique = TRUE))
+    gpl_tab <- gpl_tab[-1]
+  }
+
+  id_candidates  <- c("ID", "ID_REF", "Probe", "PROBE_ID", "probe_id")
+  sym_candidates <- c("Gene Symbol", "GENE_SYMBOL", "Symbol", "SYMBOL", "GeneSymbol", "gene_assignment", "gene symbol", "gene_symbol")
+
+  id_col  <- pick_col(names(gpl_tab), id_candidates)
+  sym_col <- pick_col(names(gpl_tab), sym_candidates)
+
+  if (is.na(id_col))  id_col <- names(gpl_tab)[1]
+  if (is.na(sym_col)) {
+    sym_hits <- grep("symbol|gene", tolower(names(gpl_tab)), value = TRUE)
+    if (length(sym_hits) == 0) stop("Cannot find GeneSymbol-like column in GPL")
+    sym_col <- sym_hits[1]
+  }
+
+  anno <- gpl_tab[, .(
+    ID_REF = as.character(get(id_col)),
+    GeneSymbol_raw = as.character(get(sym_col))
+  )]
+  anno[, GeneSymbol := vapply(GeneSymbol_raw, clean_symbol, character(1))]
+  anno <- unique(anno[!is.na(ID_REF) & ID_REF != "" & !is.na(GeneSymbol) & GeneSymbol != "", .(ID_REF, GeneSymbol)])
+  anno
+}
+
+collapse_to_gene_maxvar <- function(expr_probe_mat, anno_dt, keep_genes = NULL) {
+  # expr_probe_mat: probe x sample numeric matrix
+  stopifnot(!is.null(rownames(expr_probe_mat)))
+
+  anno2 <- anno_dt[ID_REF %in% rownames(expr_probe_mat)]
+  if (!is.null(keep_genes)) {
+    anno2 <- anno2[GeneSymbol %in% keep_genes]
+  }
+  if (nrow(anno2) == 0) stop("No overlap probes/genes after filtering")
+
+  sub_expr <- expr_probe_mat[anno2$ID_REF, , drop = FALSE]
+  vars <- apply(sub_expr, 1, var, na.rm = TRUE)
+
+  anno2 <- copy(anno2)
+  anno2[, probe_var := vars[match(ID_REF, rownames(sub_expr))]]
+  setorder(anno2, GeneSymbol, -probe_var)
+  best <- anno2[, .SD[1], by = GeneSymbol]
+
+  expr_gene <- expr_probe_mat[best$ID_REF, , drop = FALSE]
+  rownames(expr_gene) <- best$GeneSymbol
+  expr_gene <- expr_gene[sort(rownames(expr_gene)), , drop = FALSE]
+  list(expr_gene = expr_gene, best_map = best)
+}
+
+standardize_by_train <- function(X_train_gxs, X_new_gxs) {
+  common <- intersect(rownames(X_train_gxs), rownames(X_new_gxs))
+  if (length(common) < 10) stop("Too few common genes between train and new data")
+
+  X_train <- X_train_gxs[common, , drop = FALSE]
+  X_new   <- X_new_gxs[common, , drop = FALSE]
+
+  mu <- rowMeans(X_train, na.rm = TRUE)
+  sdv <- apply(X_train, 1, sd, na.rm = TRUE)
+  sdv[sdv == 0 | is.na(sdv)] <- 1
+
+  Z_train <- sweep(sweep(X_train, 1, mu, "-"), 1, sdv, "/")
+  Z_new   <- sweep(sweep(X_new,   1, mu, "-"), 1, sdv, "/")
+
+  list(Z_train = Z_train, Z_new = Z_new, mu = mu, sd = sdv, common_genes = common)
+}
+
+# Robust label parsing for GSE33000 series-matrix metadata
+make_labels_gse33000 <- function(meta_dt) {
+  fields <- setdiff(names(meta_dt), "GSM")
+  row_text <- apply(meta_dt[, ..fields], 1, function(x) paste(na.omit(as.character(x)), collapse = " | "))
+
+  is_hd  <- grepl("(huntington|\\bHD\\b)", row_text, ignore.case = TRUE, perl = TRUE)
+  is_ad  <- grepl("(alzheimer|\\bAD\\b|load|dementia)", row_text, ignore.case = TRUE, perl = TRUE)
+  is_ctl <- grepl("(control|normal|healthy|non\\s*-?dement)", row_text, ignore.case = TRUE, perl = TRUE)
+
+  y <- rep(NA_character_, nrow(meta_dt))
+  y[is_ad  & !is_ctl & !is_hd] <- "AD"
+  y[is_ctl & !is_ad  & !is_hd] <- "Control"
+  y[is_hd] <- "HD"
+
+  data.table(GSM = meta_dt$GSM, y = y, row_text = row_text)
+}
+
+# Map expression matrix (feature x sample) to gene x sample using a GPL table
+map_expr_to_gene_maxvar <- function(expr_feature_x_sample, platform_id, keep_genes = NULL) {
+  anno <- get_probe_gene_mapping(platform_id)
+
+  # GEOquery getGEO expr rows are feature IDs (probe IDs)
+  expr_probe <- expr_feature_x_sample
+  # ensure IDs are character
+  rownames(expr_probe) <- as.character(rownames(expr_probe))
+
+  collapsed <- collapse_to_gene_maxvar(expr_probe, anno, keep_genes)
+  collapsed
+}
+
+# ---------------------------
+# 1) Load core genes (optional)
+# ---------------------------
+core_genes <- NULL
+if (!is.null(CFG$core_gene_csv) && file.exists(CFG$core_gene_csv)) {
+  core_dt <- fread(CFG$core_gene_csv)
+  # flexible gene column detection
+  gene_col <- names(core_dt)[match(TRUE, tolower(names(core_dt)) %in% c("genesymbol", "gene", "symbol", "hgnc_symbol", "gene_symbol"))]
+  if (is.na(gene_col)) gene_col <- names(core_dt)[1]
+
+  core_genes <- unique(trimws(as.character(core_dt[[gene_col]])))
+  core_genes <- core_genes[!is.na(core_genes) & core_genes != ""]
+  log_msg("[Core] loaded", length(core_genes), "genes from", CFG$core_gene_csv, "(col:", gene_col, ")")
+} else {
+  log_msg("[Core] core gene file not found -> proceeding WITHOUT core filtering (not recommended for your pipeline)")
+}
+
+# ---------------------------
+# 2) TRAIN: GSE33000 (series matrix)
+# ---------------------------
+log_msg("=== TRAIN: GSE33000 ===")
+
+if (!file.exists(CFG$train_series_matrix_gz)) {
+  stop("TRAIN series matrix not found: ", CFG$train_series_matrix_gz,
+       "\nPlace it in the repo root or update CFG$train_series_matrix_gz")
+}
+
+train_dt <- read_series_matrix_table(CFG$train_series_matrix_gz)
+train_sample_cols <- setdiff(names(train_dt), "ID_REF")
+train_probe_mat <- as.matrix(train_dt[, ..train_sample_cols])
+rownames(train_probe_mat) <- train_dt$ID_REF
+mode(train_probe_mat) <- "numeric"
+
+log_msg("[Train] probe-matrix:", nrow(train_probe_mat), "probes x", ncol(train_probe_mat), "samples")
+
+# probe -> gene mapping
+train_anno <- get_probe_gene_mapping(CFG$train_platform_id)
+
+# collapse to gene (and filter to core_genes if provided)
+train_collapsed <- collapse_to_gene_maxvar(train_probe_mat, train_anno, keep_genes = core_genes)
+train_gene_mat_gxs <- train_collapsed$expr_gene  # genes x samples
+train_best_map <- train_collapsed$best_map
+log_msg("[Train] gene-matrix:", nrow(train_gene_mat_gxs), "genes x", ncol(train_gene_mat_gxs), "samples")
+
+# labels from series meta
+train_meta <- parse_series_matrix_sample_meta(CFG$train_series_matrix_gz)
+train_lab  <- make_labels_gse33000(train_meta)
+
+# keep AD/Control only (exclude HD)
+keep_idx <- which(train_lab$y %in% c("AD", "Control"))
+if (length(keep_idx) < 10) stop("Too few labeled samples in GSE33000 after filtering")
+
+train_keep_gsm <- train_lab$GSM[keep_idx]
+
+# Align expression sample columns to labels
+common_samples <- intersect(colnames(train_gene_mat_gxs), train_keep_gsm)
+if (length(common_samples) < 10) {
+  stop("Sample IDs do not match between expression columns and GSM labels.\n",
+       "Check whether series matrix columns are GSM IDs.")
+}
+
+# subset and order
+train_gene_mat_gxs <- train_gene_mat_gxs[, common_samples, drop = FALSE]
+train_lab_sub <- train_lab[match(common_samples, train_lab$GSM)]
+
+y_train <- ifelse(train_lab_sub$y == "AD", 1, 0)
+log_msg("[Train] label counts:", paste(names(table(train_lab_sub$y)), table(train_lab_sub$y), collapse = ", "))
+
+# Save mapping + expression
+fwrite(train_best_map, file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_train_probe_mapping.csv")))
+fwrite(as.data.table(train_gene_mat_gxs, keep.rownames = "GeneSymbol"), file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_train_expr_gene_x_sample.csv")))
+
+# ---------------------------
+# 3) TEST: GSE122063 (getGEO)
+# ---------------------------
+log_msg("=== TEST: ", CFG$test_gse_id, " ===")
+
+# getGEO
+# If multiple platforms -> choose the one with most samples
+test_list <- getGEO(CFG$test_gse_id, GSEMatrix = TRUE, getGPL = TRUE)
+if (length(test_list) > 1) {
+  ns <- sapply(test_list, ncol)
+  test_eset <- test_list[[which.max(ns)]]
+  log_msg("[Test] multiple platforms -> selected:", annotation(test_eset), "nSamples=", max(ns))
+} else {
+  test_eset <- test_list[[1]]
+  log_msg("[Test] platform:", annotation(test_eset), "nSamples=", ncol(test_eset))
+}
+
+test_expr_fxS <- exprs(test_eset)  # feature x sample
+test_pheno <- pData(test_eset)
+
+# labels: AD/Control only, vascular removed
+if (!(CFG$test_diag_col %in% colnames(test_pheno))) {
+  stop("Test pheno does not contain diagnosis column: ", CFG$test_diag_col,
+       "\nAvailable columns: ", paste(colnames(test_pheno), collapse = ", "))
+}
+
+dx <- tolower(trimws(as.character(test_pheno[[CFG$test_diag_col]])))
+is_vascular <- str_detect(dx, "vascular")
+is_ad       <- str_detect(dx, "alzheimer") | str_detect(dx, "\\bad\\b")
+is_ctl      <- str_detect(dx, "\\bcontrol\\b|normal|healthy|non[- ]?demented|nondemented")
+
+test_keep <- (!is_vascular) & (is_ad | is_ctl)
+if (sum(test_keep) < 10) stop("Too few test samples kept after diagnosis filtering")
+
+y_test_chr <- rep(NA_character_, length(dx))
+y_test_chr[test_keep & is_ad] <- "AD"
+y_test_chr[test_keep & is_ctl & !is_ad] <- "Control"  # control if not AD
+
+test_expr_fxS <- test_expr_fxS[, test_keep, drop = FALSE]
+test_pheno_sub <- test_pheno[test_keep, , drop = FALSE]
+y_test_chr <- y_test_chr[test_keep]
+
+if (sum(y_test_chr == "AD") == 0 || sum(y_test_chr == "Control") == 0) {
+  stop("Test set has 0 AD or 0 Control after filtering. Adjust regex in this script.")
+}
+
+log_msg("[Test] label counts:", paste(names(table(y_test_chr)), table(y_test_chr), collapse = ", "))
+
+# Map to gene symbols using test platform (annotation(test_eset))
+# Filter to training genes (and core_genes if you provided it)
+# Priority: ensure overlap with training feature space.
+
+# First collapse without filtering to see what we have
+test_platform <- annotation(test_eset)
+log_msg("[Test] mapping with platform:", test_platform)
+
+# If your downstream must stay in core space, filter to core_genes.
+# Else, filter to training genes later.
+keep_for_mapping <- core_genes
+
+# Some test platforms may not have core genes; we will fallback to mapping all genes.
+try_collapsed <- try(map_expr_to_gene_maxvar(test_expr_fxS, test_platform, keep_genes = keep_for_mapping), silent = TRUE)
+if (inherits(try_collapsed, "try-error")) {
+  log_msg("[Test] core-filtered mapping failed -> mapping all genes (fallback)")
+  test_collapsed <- map_expr_to_gene_maxvar(test_expr_fxS, test_platform, keep_genes = NULL)
+} else {
+  test_collapsed <- try_collapsed
+}
+
+test_gene_mat_gxs <- test_collapsed$expr_gene  # genes x samples
+log_msg("[Test] gene-matrix:", nrow(test_gene_mat_gxs), "genes x", ncol(test_gene_mat_gxs), "samples")
+
+# Save test gene expression
+fwrite(as.data.table(test_gene_mat_gxs, keep.rownames = "GeneSymbol"), file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_test_expr_gene_x_sample.csv")))
+
+# ---------------------------
+# 4) Standardize (by TRAIN) + Prepare design matrices
+# ---------------------------
+log_msg("=== Standardize by TRAIN ===")
+
+std <- standardize_by_train(train_gene_mat_gxs, test_gene_mat_gxs)
+Z_train_gxs <- std$Z_train
+Z_test_gxs  <- std$Z_new
+
+# Remove genes with any NA in TRAIN (strict, for glmnet)
+na_train <- which(!is.finite(rowSums(Z_train_gxs)))
+if (length(na_train) > 0) {
+  Z_train_gxs <- Z_train_gxs[-na_train, , drop = FALSE]
+  Z_test_gxs  <- Z_test_gxs[-na_train, , drop = FALSE]
+}
+
+# Additionally remove genes with any NA in either set
+keep_gene <- which(apply(Z_train_gxs, 1, function(v) all(is.finite(v))) &
+                     apply(Z_test_gxs,  1, function(v) all(is.finite(v))))
+Z_train_gxs <- Z_train_gxs[keep_gene, , drop = FALSE]
+Z_test_gxs  <- Z_test_gxs[keep_gene, , drop = FALSE]
+
+log_msg("[Std] final genes used:", nrow(Z_train_gxs))
+
+# glmnet expects samples x features
+X_train <- t(Z_train_gxs)
+X_test  <- t(Z_test_gxs)
+
+# ---------------------------
+# 5) Train LASSO (cv.glmnet) + Evaluate
+# ---------------------------
+log_msg("=== Train LASSO ===")
+
+cvfit <- cv.glmnet(
+  x = X_train,
+  y = y_train,
+  family = "binomial",
+  alpha = CFG$alpha,
+  nfolds = CFG$nfolds,
+  type.measure = "auc"
+)
+
+lambda_use <- if (CFG$lambda_choice == "lambda.min") cvfit$lambda.min else cvfit$lambda.1se
+log_msg("[Model] lambda.min =", signif(cvfit$lambda.min, 4), ", lambda.1se =", signif(cvfit$lambda.1se, 4), ", use =", CFG$lambda_choice)
+
+# Selected genes
+coef_mat <- coef(cvfit, s = lambda_use)
+coef_dt <- data.table(
+  GeneSymbol = rownames(coef_mat),
+  Coef = as.numeric(coef_mat)
+)
+coef_dt <- coef_dt[GeneSymbol != "(Intercept)"]
+sel_dt <- coef_dt[Coef != 0]
+setorder(sel_dt, -abs(Coef))
+
+log_msg("[Model] selected genes:", nrow(sel_dt))
+
+# Predictions
+p_train <- as.numeric(predict(cvfit, newx = X_train, s = lambda_use, type = "response"))
+p_test  <- as.numeric(predict(cvfit, newx = X_test,  s = lambda_use, type = "response"))
+
+roc_train <- roc(y_train, p_train, quiet = TRUE)
+y_test <- ifelse(y_test_chr == "AD", 1, 0)
+roc_test  <- roc(y_test,  p_test,  quiet = TRUE)
+
+auc_train <- as.numeric(auc(roc_train))
+auc_test  <- as.numeric(auc(roc_test))
+log_msg("[AUC] train=", round(auc_train, 4), ", test=", round(auc_test, 4))
+
+# ---------------------------
+# 6) Save outputs
+# ---------------------------
+# Tables
+fwrite(sel_dt, file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_selected_genes.csv")))
+fwrite(coef_dt, file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_all_coefficients.csv")))
+
+perf_dt <- data.table(
+  dataset = c("train_GSE33000", paste0("test_", CFG$test_gse_id)),
+  AUC = c(auc_train, auc_test),
+  lambda_used = as.character(lambda_use),
+  lambda_choice = CFG$lambda_choice,
+  alpha = CFG$alpha,
+  nfolds = CFG$nfolds,
+  n_genes_used = nrow(Z_train_gxs),
+  n_genes_selected = nrow(sel_dt)
+)
+fwrite(perf_dt, file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_performance.csv")))
+
+# Figures
+png(file.path(CFG$out_dir, "figures", paste0(CFG$prefix, "_roc_train.png")), width = 900, height = 700)
+plot(roc_train, main = paste0("ROC TRAIN (AUC=", round(auc_train, 3), ")"))
+dev.off()
+
+png(file.path(CFG$out_dir, "figures", paste0(CFG$prefix, "_roc_test.png")), width = 900, height = 700)
+plot(roc_test, main = paste0("ROC TEST ", CFG$test_gse_id, " (AUC=", round(auc_test, 3), ")"))
+dev.off()
+
+png(file.path(CFG$out_dir, "figures", paste0(CFG$prefix, "_coef_path.png")), width = 1100, height = 800)
+plot(cvfit$glmnet.fit, xvar = "lambda", label = FALSE, main = "Coefficient paths")
+abline(v = log(lambda_use), lty = 2)
+dev.off()
+
+# Save model object + standardization params
+saveRDS(list(
+  cfg = CFG,
+  cvfit = cvfit,
+  lambda_use = lambda_use,
+  selected = sel_dt,
+  mu = std$mu,
+  sd = std$sd,
+  common_genes = std$common_genes,
+  genes_used = rownames(Z_train_gxs)
+), file.path(CFG$out_dir, paste0(CFG$prefix, "_model_bundle.rds")))
+
+log_msg("DONE. Outputs saved to:", normalizePath(CFG$out_dir))
