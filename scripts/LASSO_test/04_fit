@@ -1,0 +1,78 @@
+# 04_fit_lasso_and_report.R
+log_msg("=== STANDARDIZE + FIT LASSO ===")
+
+# Standardize using TRAIN stats; align genes
+std <- standardize_by_train(state$train_gene_mat_gxs, state$test_gene_mat_gxs)
+Z_train_gxs <- std$Z_train
+Z_test_gxs  <- std$Z_test
+
+# remove genes with any non-finite values
+keep_gene <- apply(Z_train_gxs, 1, function(v) all(is.finite(v))) &
+             apply(Z_test_gxs,  1, function(v) all(is.finite(v)))
+
+Z_train_gxs <- Z_train_gxs[keep_gene, , drop=FALSE]
+Z_test_gxs  <- Z_test_gxs[keep_gene, , drop=FALSE]
+log_msg("[Std] final genes used: ", nrow(Z_train_gxs))
+
+# glmnet expects samples x features
+X_train <- t(Z_train_gxs)
+X_test  <- t(Z_test_gxs)
+
+# Fit
+cvfit <- fit_lasso_cv(X_train, state$y_train, alpha = CFG$alpha, nfolds = CFG$nfolds)
+lambda_use <- if (CFG$lambda_choice == "lambda.min") cvfit$lambda.min else cvfit$lambda.1se
+log_msg("[Model] lambda.min=", signif(cvfit$lambda.min,4), " lambda.1se=", signif(cvfit$lambda.1se,4), " use=", CFG$lambda_choice)
+
+# Coefs
+coefs <- extract_coefficients(cvfit, lambda_use)
+coef_dt <- coefs$all
+sel_dt  <- coefs$selected
+log_msg("[Model] selected genes: ", nrow(sel_dt))
+
+# Predict
+p_train <- as.numeric(predict(cvfit, newx = X_train, s = lambda_use, type = "response"))
+p_test  <- as.numeric(predict(cvfit, newx = X_test,  s = lambda_use, type = "response"))
+
+roc_train <- roc(state$y_train, p_train, quiet = TRUE)
+roc_test  <- roc(state$y_test,  p_test,  quiet = TRUE)
+
+auc_train <- as.numeric(auc(roc_train))
+auc_test  <- as.numeric(auc(roc_test))
+log_msg("[AUC] train=", round(auc_train,4), " test=", round(auc_test,4))
+
+# Save tables
+fwrite(sel_dt,  file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_selected_genes.csv")))
+fwrite(coef_dt, file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_all_coefficients.csv")))
+
+perf_dt <- data.table(
+  dataset = c("train_GSE33000", paste0("test_", CFG$test_gse_id)),
+  AUC = c(auc_train, auc_test),
+  lambda_used = as.character(lambda_use),
+  lambda_choice = CFG$lambda_choice,
+  alpha = CFG$alpha,
+  nfolds = CFG$nfolds,
+  n_genes_used = nrow(Z_train_gxs),
+  n_genes_selected = nrow(sel_dt)
+)
+fwrite(perf_dt, file.path(CFG$out_dir, "tables", paste0(CFG$prefix, "_performance.csv")))
+
+# Figures
+save_roc_plot(roc_train, file.path(CFG$out_dir, "figures", paste0(CFG$prefix, "_roc_train.png")),
+              paste0("ROC TRAIN (AUC=", round(auc_train,3), ")"))
+save_roc_plot(roc_test, file.path(CFG$out_dir, "figures", paste0(CFG$prefix, "_roc_test.png")),
+              paste0("ROC TEST ", CFG$test_gse_id, " (AUC=", round(auc_test,3), ")"))
+save_coef_path(cvfit, lambda_use, file.path(CFG$out_dir, "figures", paste0(CFG$prefix, "_coef_path.png")))
+
+# Save bundle for reproducibility
+saveRDS(list(
+  cfg = CFG,
+  cvfit = cvfit,
+  lambda_use = lambda_use,
+  selected = sel_dt,
+  mu = std$mu,
+  sd = std$sd,
+  common_genes = std$common_genes,
+  genes_used = rownames(Z_train_gxs)
+), file.path(CFG$out_dir, paste0(CFG$prefix, "_model_bundle.rds")))
+
+log_msg("DONE. Outputs saved to: ", normalizePath(CFG$out_dir))
