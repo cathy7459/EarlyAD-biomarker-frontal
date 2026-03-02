@@ -195,3 +195,29 @@ write.csv(meta_out, file.path(params$out_dir, "sample_metadata_frontal.csv"), ro
 
 core_mat <- cbind(GeneSymbol = rownames(expr_core), as.data.frame(expr_core))
 write.csv(core_mat, file.path(params$out_dir, "core_expression_gene_x_sample.csv"), row.names = FALSE)
+
+# 6) is PCA expansion but it will be in following codes so skipped here.
+# ----------------------------
+# 7) Save session object
+# ----------------------------
+message("[7/7] Saving RDS")
+
+saveRDS(list(
+  params = params,
+  group_col = group_col,
+  region_col = region_col,
+  frontal_regex = params$frontal_regex,
+  expr_frontal_filtered = expr_f2,
+  group_frontal = grp_f,
+  deg = list(
+    AsymAD_vs_Control = deg1,
+    AD_vs_Control = deg2,
+    AD_vs_AsymAD = deg3
+  ),
+  core_probes = core_probes,
+  core_genes  = core_genes,
+  expr_gene_all = expr_gene_all,
+  expr_core = expr_core
+), file = file.path(params$out_dir, "pcgs_frontal_pipeline.rds"))
+
+message("Done. Outputs written to: ", params$out_dir)
