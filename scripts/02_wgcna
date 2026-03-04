@@ -30,6 +30,8 @@ suppressPackageStartupMessages({
   library(readr)
 })
 
+source(file.path("R", "utils","PCA_WGCNA.R"))
+
 # ------------------------------- Helpers --------------------------------------
 
 log_step <- function(msg) {
