@@ -1,6 +1,6 @@
 
 # scripts/01_build_expr_gse33000_with_gpl.R
-source(file.path("scripts/LASSO_train/00_setup.R"))
+source(file.path("scripts", "00_setup.R"))
 
 log_msg("RUNNING FILE: scripts/01_build_expr_gse33000_with_gpl.R")
 log_msg("GEOquery.destdir = ", getOption("GEOquery.destdir"))
@@ -28,6 +28,33 @@ stopifnot(!is.null(expr_mat), nrow(expr_mat) > 0, ncol(expr_mat) > 0, !is.null(r
 # Save phenotype metadata
 pheno_dt <- as.data.table(pData(gse), keep.rownames = TRUE)
 setnames(pheno_dt, "rn", "Sample")
+
+# ------------------------------------------------------------
+# Remove Huntington's disease samples (GSE33000 contains HD)
+# ------------------------------------------------------------
+
+log_msg("Filtering out Huntington's disease samples")
+
+# collapse phenotype text for robust detection
+pheno_text <- apply(pheno_dt, 1, function(x) paste(as.character(x), collapse = " | "))
+
+hd_idx <- grepl("huntington", pheno_text, ignore.case = TRUE)
+
+if (any(hd_idx)) {
+  hd_samples <- pheno_dt$Sample[hd_idx]
+  
+  log_msg("HD samples detected: ", length(hd_samples))
+  
+  # remove from phenotype table
+  pheno_dt <- pheno_dt[!Sample %in% hd_samples]
+  
+  # remove from expression matrix
+  expr_mat <- expr_mat[, !colnames(expr_mat) %in% hd_samples, drop = FALSE]
+  
+  log_msg("After HD removal: samples=", ncol(expr_mat))
+} else {
+  log_msg("No Huntington's disease samples detected")
+}
 
 # ---- sanitize fwrite output path ----
 OUT_PHENO_CSV <- file.path("data","processed","GSE33000_pheno.csv")
@@ -272,3 +299,34 @@ fwrite(res_red$r2_table, "data/processed/GSE33000_core_gene_R2.csv")
 fwrite(res_red$r2_table, "data/processed/GSE33000_selected_core_gene _R2.csv")
 
 log_msg("DONE. genes=", nrow(expr_gene), " samples=", length(sample_cols))
+# ---- 4) Save outputs (full gene matrix + projected/reduced matrix) ----
+if (!dir.exists("data/processed")) dir.create("data/processed", recursive = TRUE)
+
+# (A) Full gene-level expression (genes x samples)
+out_expr_gene_full <- file.path("data", "processed", "gse33000_expr_gene_x_sample.csv")
+expr_gene_dt_full <- as.data.table(expr_gene_mat, keep.rownames = TRUE)
+setnames(expr_gene_dt_full, "rn", "GeneSymbol")
+fwrite(expr_gene_dt_full, out_expr_gene_full)
+log_msg("Saved full gene-level expression: ", out_expr_gene_full)
+
+# (B) "Projected / reduced" expression matrix (selected genes x samples)
+expr_proj_mat <- expr_gene_mat[selected, , drop = FALSE]
+out_expr_proj <- file.path("data", "processed", "gse33000_expr_projected_gene_x_sample.csv")
+expr_proj_dt <- as.data.table(expr_proj_mat, keep.rownames = TRUE)
+setnames(expr_proj_dt, "rn", "GeneSymbol")
+fwrite(expr_proj_dt, out_expr_proj)
+log_msg("Saved projected/reduced expression: ", out_expr_proj, " (genes=", nrow(expr_proj_mat), ")")
+
+# (C) R2 table
+out_r2 <- file.path("data", "processed", "GSE33000_core_gene_R2.csv")
+fwrite(res_red$r2_table, out_r2)
+log_msg("Saved R2 table: ", out_r2)
+
+# (D) Selected gene list
+out_sel <- file.path("data", "processed", "GSE33000_selected_core_genes.txt")
+writeLines(selected, out_sel)
+log_msg("Saved selected core genes: ", out_sel)
+
+log_msg("DONE. genes(full)=", nrow(expr_gene_mat),
+        " genes(projected)=", nrow(expr_proj_mat),
+        " samples=", ncol(expr_gene_mat))
