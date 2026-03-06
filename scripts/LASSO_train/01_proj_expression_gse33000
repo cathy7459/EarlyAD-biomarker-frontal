@@ -1,4 +1,4 @@
-# scripts/01_build_expr_gse33000_with_gpl.R
+# scripts/01_proj_expression_gse33000.R
 source(file.path("scripts/LASSO_train/00_setup.R"))
 
 log_msg("RUNNING FILE: scripts/01_proj_expression_gse33000.R")
