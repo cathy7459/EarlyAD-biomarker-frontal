@@ -1,47 +1,259 @@
-source("scripts/00_setup.R")
+# scripts/03_lasso_train_validate.R
+source(file.path("scripts/LASSO_train/00_setup.R"))
 
-expr_path <- file.path(DIR_DATA_PROCESSED, "gse33000_expr_filtered_gene_x_sample.csv")
-if (!file.exists(expr_path)) stop("Missing filtered expression: ", expr_path, " (run scripts/02_deg_effect_filter.R)")
+log_msg("RUNNING FILE: scripts/03_lasso_train_validate.R")
 
-meta_path <- GSE33000_SAMPLE_META_CSV
-if (!file.exists(meta_path)) stop("Missing metadata: ", meta_path)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(glmnet)
+  library(pROC)
+})
 
-log_msg("[3/3] Loading filtered expression and metadata ...")
+# ------------------------------------------------------------
+# 0) Paths
+# ------------------------------------------------------------
+expr_path_candidates <- c(
+  file.path("data", "processed", "gse33000_expr_filtered_postproj_gene_x_sample.csv"),
+  file.path("data", "processed", "gse33000_expr_filtered_gene_x_sample.csv")
+)
+
+expr_path <- expr_path_candidates[file.exists(expr_path_candidates)][1]
+
+if (is.na(expr_path) || !nzchar(expr_path)) {
+  stop(
+    "Missing filtered expression matrix.\nChecked:\n",
+    paste(expr_path_candidates, collapse = "\n"),
+    "\nRun scripts/02_deg_effect_filter.R first."
+  )
+}
+
+meta_path <- file.path("data", "processed", "sample_metadata_gse33000.csv")
+if (!file.exists(meta_path)) {
+  stop("Missing metadata: ", meta_path)
+}
+
+out_sel <- file.path("outputs", "tables", "lasso_selected_genes.csv")
+out_coef <- file.path("outputs", "tables", "lasso_coefficients.csv")
+out_pred <- file.path("outputs", "tables", "lasso_train_predictions.csv")
+out_roc  <- file.path("outputs", "figures", "roc_train.png")
+
+dir.create(dirname(out_sel), recursive = TRUE, showWarnings = FALSE)
+dir.create(dirname(out_roc), recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------
+# 1) Load expression
+# ------------------------------------------------------------
+log_msg("[1/4] Loading filtered expression: ", expr_path)
+
 expr_dt <- fread(expr_path)
-expr <- as.data.frame(expr_dt[, -1])
+stopifnot("GeneSymbol" %in% names(expr_dt))
+
+expr <- as.data.frame(expr_dt[, -1, with = FALSE])
 rownames(expr) <- expr_dt$GeneSymbol
 
-meta <- as.data.frame(fread(meta_path))
-meta <- meta[match(colnames(expr), meta$sample_id), , drop = FALSE]
-if (anyNA(meta$sample_id)) stop("Metadata does not match expression columns.")
+# genes x samples -> ensure numeric
+expr[] <- lapply(expr, as.numeric)
 
-# X: samples x genes
-X <- t(as.matrix(expr))
-y <- factor(meta$condition)
-if (!all(levels(y) %in% c("AD", "Control"))) {
-  # force to 0/1 in current order if needed
-  y <- factor(y)
+# ------------------------------------------------------------
+# 2) Load metadata and align samples
+# ------------------------------------------------------------
+log_msg("[2/4] Loading metadata: ", meta_path)
+
+meta <- as.data.frame(fread(meta_path))
+
+required_meta_cols <- c("sample_id", "condition")
+if (!all(required_meta_cols %in% names(meta))) {
+  stop("Metadata must contain columns: ", paste(required_meta_cols, collapse = ", "))
 }
+
+meta$sample_id <- trimws(as.character(meta$sample_id))
+meta$condition <- trimws(as.character(meta$condition))
+
+# keep only AD / Control
+meta <- meta[meta$condition %in% c("AD", "Control"), , drop = FALSE]
+meta <- meta[!duplicated(meta$sample_id), , drop = FALSE]
+
+common_samples <- intersect(colnames(expr), meta$sample_id)
+if (length(common_samples) < 20) {
+  stop("Too few matched samples between expression and metadata: ", length(common_samples))
+}
+
+expr <- expr[, common_samples, drop = FALSE]
+meta <- meta[match(common_samples, meta$sample_id), , drop = FALSE]
+
+stopifnot(identical(colnames(expr), meta$sample_id))
+
+log_msg("Matched samples: ", ncol(expr))
+log_msg("AD samples: ", sum(meta$condition == "AD"))
+log_msg("Control samples: ", sum(meta$condition == "Control"))
+
+# ------------------------------------------------------------
+# 3) Build glmnet input
+# ------------------------------------------------------------
+# glmnet wants samples x genes
+x <- t(as.matrix(expr))
+storage.mode(x) <- "double"
+
+if (anyNA(x)) {
+  
+  log_msg("NA detected in x -> performing median imputation")
+  
+  for (j in seq_len(ncol(x))) {
+    idx <- is.na(x[,j])
+    if (any(idx)) {
+      x[idx,j] <- median(x[,j], na.rm=TRUE)
+    }
+  }
+  
+  log_msg("Remaining NA: ", sum(is.na(x)))
+}
+
+# outcome: Control = 0, AD = 1
+y <- factor(meta$condition, levels = c("Control", "AD"))
+if (anyNA(y)) stop("Outcome y contains NA.")
 y_bin <- ifelse(y == "AD", 1, 0)
 
-log_msg("[3/3] Training LASSO (glmnet) ...")
-fit <- train_lasso(X, y_bin, cv_folds = CV_FOLDS, seed = SEED)
-lam <- pick_lambda(fit$cv, USE_LAMBDA)
+# remove zero-variance features
+feature_sd <- apply(x, 2, sd, na.rm = TRUE)
+keep_feat <- is.finite(feature_sd) & !is.na(feature_sd) & feature_sd > 0
 
-sel <- selected_genes(fit$cv$glmnet.fit, lam)
-out_sel <- file.path(DIR_OUT_TABLES, "lasso_selected_genes.csv")
-fwrite(sel, out_sel)
-log_msg("Saved: ", out_sel)
-
-# Train ROC
-prob_train <- as.numeric(predict(fit$cv, newx = X, s = lam, type = "response"))
-roc_out <- roc_plot_to_file(prob_train, y_bin, file.path(DIR_OUT_FIGURES, "roc_train.png"))
-log_msg("Train AUC: ", sprintf("%.3f", roc_out$auc))
-
-# Optional validation
-if (!is.null(VALID_SERIES_MATRIX_GZ) && file.exists(VALID_SERIES_MATRIX_GZ)) {
-  log_msg("Validation series matrix found. NOTE: this scaffold does not auto-map validation yet.")
-  log_msg("If you want validation, add a script to build the validation gene×sample matrix and metadata, then project to selected genes.")
-} else {
-  log_msg("No validation dataset configured/found. Skipping validation.")
+if (sum(keep_feat) == 0) {
+  stop("No non-constant features available for LASSO.")
 }
+
+x <- x[, keep_feat, drop = FALSE]
+
+# final checks
+if (anyNA(x)) {
+  na_idx <- which(is.na(x), arr.ind = TRUE)
+  print(head(na_idx, 20))
+  stop("x has missing values.")
+}
+if (any(!is.finite(x))) {
+  bad_idx <- which(!is.finite(x), arr.ind = TRUE)
+  print(head(bad_idx, 20))
+  stop("x has non-finite values (Inf / -Inf / NaN).")
+}
+
+log_msg("[3/4] LASSO input ready: samples=", nrow(x), " genes=", ncol(x))
+
+# ------------------------------------------------------------
+# 4) Train cv.glmnet
+# ------------------------------------------------------------
+if (!exists("SEED")) SEED <- 1234
+if (!exists("CV_FOLDS")) CV_FOLDS <- 10
+if (!exists("USE_LAMBDA")) USE_LAMBDA <- "lambda.1se"  # or "lambda.min"
+
+set.seed(SEED)
+
+log_msg("[4/4] Training LASSO (cv.glmnet) ...")
+cvfit <- cv.glmnet(
+  x = x,
+  y = y_bin,
+  family = "binomial",
+  alpha = 1,
+  nfolds = CV_FOLDS,
+  standardize = TRUE,
+  type.measure = "auc"
+)
+
+lam <- switch(
+  USE_LAMBDA,
+  "lambda.min" = cvfit$lambda.min,
+  "lambda.1se" = cvfit$lambda.1se,
+  stop("USE_LAMBDA must be 'lambda.min' or 'lambda.1se'")
+)
+
+log_msg("Selected lambda mode: ", USE_LAMBDA)
+log_msg("Selected lambda value: ", signif(lam, 4))
+
+# ------------------------------------------------------------
+# 5) Extract selected genes / coefficients
+# ------------------------------------------------------------
+coef_mat <- as.matrix(coef(cvfit, s = lam))
+coef_dt <- data.table(
+  Feature = rownames(coef_mat),
+  Coefficient = as.numeric(coef_mat[, 1])
+)
+
+# remove intercept
+coef_dt_noint <- coef_dt[Feature != "(Intercept)"]
+
+sel_dt <- coef_dt_noint[Coefficient != 0]
+
+sel_dt[, abs_coef := abs(Coefficient)]
+setorder(sel_dt, -abs_coef)
+sel_dt[, abs_coef := NULL]
+
+fwrite(sel_dt, out_sel)
+fwrite(coef_dt, out_coef)
+
+log_msg("Saved selected genes: ", out_sel)
+log_msg("Saved full coefficient table: ", out_coef)
+log_msg("Selected nonzero genes: ", nrow(sel_dt))
+
+# ------------------------------------------------------------
+# 6) Train predictions / ROC
+# ------------------------------------------------------------
+prob_train <- as.numeric(predict(cvfit, newx = x, s = lam, type = "response"))
+
+pred_dt <- data.table(
+  sample_id = rownames(x),
+  condition = as.character(y),
+  y_bin = y_bin,
+  prob_AD = prob_train
+)
+fwrite(pred_dt, out_pred)
+log_msg("Saved train predictions: ", out_pred)
+
+roc_obj <- pROC::roc(response = y_bin, predictor = prob_train, quiet = TRUE)
+auc_val <- as.numeric(pROC::auc(roc_obj))
+
+png(out_roc, width = 1800, height = 1600, res = 220)
+plot(
+  roc_obj,
+  main = sprintf("Training ROC (AUC = %.3f)", auc_val),
+  legacy.axes = TRUE
+)
+abline(a = 0, b = 1, lty = 2)
+dev.off()
+
+log_msg("Saved ROC figure: ", out_roc)
+log_msg("Training AUC: ", sprintf("%.3f", auc_val))
+
+log_msg("DONE. samples=", nrow(x), " genes=", ncol(x), " selected=", nrow(sel_dt))
+
+# ------------------------------------------------------------
+# ROC curve (training)
+# ------------------------------------------------------------
+
+library(pROC)
+
+prob_train <- as.numeric(predict(cvfit, newx = x, s = lam, type = "response"))
+
+roc_obj <- roc(response = y_bin, predictor = prob_train)
+
+auc_val <- auc(roc_obj)
+
+# Plot
+plot(
+  roc_obj,
+  col = "#2C7BB6",
+  lwd = 3,
+  main = paste0("Training ROC Curve (AUC = ", round(auc_val,3), ")")
+)
+
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+png("outputs/figures/roc_train.png", width = 1800, height = 1600, res = 220)
+
+plot(
+  roc_obj,
+  col = "#2C7BB6",
+  lwd = 3,
+  main = paste0("Training ROC Curve (AUC = ", round(auc_val,3), ")")
+)
+
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+dev.off()
