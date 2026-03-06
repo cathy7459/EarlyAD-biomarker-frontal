@@ -1,54 +1,209 @@
-
 # scripts/01_build_expr_gse33000_with_gpl.R
-source(file.path("scripts", "00_setup.R"))
+source(file.path("scripts/LASSO_train/00_setup.R"))
 
-log_msg("RUNNING FILE: scripts/01_build_expr_gse33000_with_gpl.R")
+log_msg("RUNNING FILE: scripts/01_proj_expression_gse33000.R")
 log_msg("GEOquery.destdir = ", getOption("GEOquery.destdir"))
 
+# -------------------------
+# 0) Required objects / fallback paths
+# -------------------------
+if (!exists("GSE_ID")) GSE_ID <- "GSE33000"
 
-# ---- 1) Load core gene list ----
-log_msg(paste0("[1/3] core gene list: ", sig_genes))
+if (!exists("OUT_MAP_CSV")) {
+  OUT_MAP_CSV <- file.path("data", "processed", "GSE33000_probe2gene.csv")
+}
+if (!exists("OUT_EXPR_GENE_CSV")) {
+  OUT_EXPR_GENE_CSV <- file.path("data", "processed", "GSE33000_expr_gene.csv")
+}
+if (!exists("OUT_EXPR_PROBE_RDS")) {
+  OUT_EXPR_PROBE_RDS <- file.path("data", "processed", "GSE33000_expr_probe.rds")
+}
+
+dir.create(file.path("data", "processed"), recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------
+# 1) Load core gene list
+# -------------------------
+log_msg("[1/3] Loading core gene list")
 core <- sig_genes
 stopifnot("GeneSymbol" %in% names(core))
-core_genes <- unique(core$GeneSymbol)
+
+core_genes <- unique(as.character(core$GeneSymbol))
+core_genes <- trimws(core_genes)
 core_genes <- core_genes[!is.na(core_genes) & core_genes != ""]
 log_msg("WGCNA Core genes: ", length(core_genes))
 
 # -------------------------
-# A) Download GSE dataset using getGEO
+# Utility functions
+# -------------------------
+detect_symbol_col <- function(dt) {
+  nms <- names(dt)
+  
+  preferred <- c(
+    "Gene Symbol", "Gene symbol", "GENE_SYMBOL", "GeneSymbol",
+    "Symbol", "SYMBOL", "gene_symbol", "ORF"
+  )
+  hit <- preferred[preferred %in% nms][1]
+  if (!is.na(hit)) return(hit)
+  
+  # fuzzy fallback
+  idx <- grep("gene.*symbol|symbol|orf", nms, ignore.case = TRUE)
+  if (length(idx) > 0) return(nms[idx[1]])
+  
+  NA_character_
+}
+
+clean_gene_symbol <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- sub("\\s*///.*$", "", x)
+  x <- sub("\\s*//.*$", "", x)
+  x <- sub("\\s*;.*$", "", x)
+  x <- sub("\\s*,.*$", "", x)
+  x <- trimws(x)
+  x[x %in% c("", "---", "NA", "na", "null", "NULL")] <- NA_character_
+  x
+}
+
+make_gene_matrix_maxvar <- function(expr_dt, map_dt) {
+  stopifnot("ID_REF" %in% names(expr_dt))
+  stopifnot(all(c("ID_REF", "GeneSymbol") %in% names(map_dt)))
+  
+  dt <- merge(
+    map_dt[, .(ID_REF = as.character(ID_REF), GeneSymbol = as.character(GeneSymbol))],
+    expr_dt,
+    by = "ID_REF",
+    all = FALSE
+  )
+  
+  if (nrow(dt) == 0) {
+    stop("No rows after merge in make_gene_matrix_maxvar().")
+  }
+  
+  sample_cols <- setdiff(names(dt), c("ID_REF", "GeneSymbol"))
+  if (length(sample_cols) == 0) {
+    stop("No sample columns found after mapping.")
+  }
+  
+  for (cc in sample_cols) {
+    dt[, (cc) := as.numeric(get(cc))]
+  }
+  
+  dt[, probe_var := apply(.SD, 1, var, na.rm = TRUE), .SDcols = sample_cols]
+  dt_best <- dt[order(-probe_var)][, .SD[1], by = GeneSymbol]
+  dt_best[, c("ID_REF", "probe_var") := NULL]
+  
+  expr_gene_mat <- as.matrix(dt_best[, ..sample_cols])
+  rownames(expr_gene_mat) <- dt_best$GeneSymbol
+  storage.mode(expr_gene_mat) <- "double"
+  
+  expr_gene_mat
+}
+
+reduce_core_genes_by_pca <- function(expr_gene_mat,
+                                     core_genes,
+                                     var_explained = 0.80,
+                                     target_n = 600) {
+  stopifnot(is.matrix(expr_gene_mat), !is.null(rownames(expr_gene_mat)))
+  
+  core_present <- intersect(core_genes, rownames(expr_gene_mat))
+  if (length(core_present) < 20) {
+    stop("Too few core genes present in expr_gene_mat: ", length(core_present))
+  }
+  
+  # samples x genes
+  X <- t(expr_gene_mat[core_present, , drop = FALSE])
+  
+  if (anyNA(X)) {
+    log_msg("NA detected in PCA input: ", sum(is.na(X)), " -> imputing")
+    
+    if (requireNamespace("impute", quietly = TRUE)) {
+      Xt <- t(X)
+      Xt_imp <- impute::impute.knn(as.matrix(Xt))$data
+      X <- t(Xt_imp)
+      log_msg("kNN imputation done. Remaining NA: ", sum(is.na(X)))
+    } else {
+      log_msg("WARN: impute package unavailable -> median imputation")
+      gene_meds <- apply(X, 2, median, na.rm = TRUE)
+      idx <- which(is.na(X), arr.ind = TRUE)
+      if (nrow(idx) > 0) X[idx] <- gene_meds[idx[, 2]]
+      log_msg("Median imputation done. Remaining NA: ", sum(is.na(X)))
+    }
+  } else {
+    log_msg("No NA in PCA input")
+  }
+  
+  pca <- prcomp(X, center = TRUE, scale. = TRUE)
+  
+  ve <- (pca$sdev^2) / sum(pca$sdev^2)
+  cumve <- cumsum(ve)
+  K <- which(cumve >= var_explained)[1]
+  if (is.na(K)) K <- min(ncol(pca$x), 10)
+  
+  scores <- pca$x[, 1:K, drop = FALSE]
+  
+  r2 <- numeric(ncol(X))
+  for (j in seq_len(ncol(X))) {
+    y <- scale(X[, j], center = TRUE, scale = TRUE)
+    if (any(is.na(y))) {
+      r2[j] <- NA_real_
+      next
+    }
+    fit <- lm.fit(x = cbind(1, scores), y = y)
+    sse <- sum(fit$residuals^2)
+    sst <- sum((y - mean(y))^2)
+    r2[j] <- if (sst > 0) 1 - sse / sst else NA_real_
+  }
+  
+  r2_dt <- data.table::data.table(
+    GeneSymbol = colnames(X),
+    R2 = r2
+  )
+  r2_dt <- r2_dt[!is.na(R2)][order(-R2)]
+  
+  target_n <- min(target_n, nrow(r2_dt))
+  selected <- r2_dt[1:target_n, GeneSymbol]
+  
+  list(
+    selected_genes = selected,
+    r2_table = r2_dt,
+    pca = pca,
+    K = K,
+    core_present = core_present
+  )
+}
+
+# -------------------------
+# A) Download GSE dataset
 # -------------------------
 log_msg("[1/4] Downloading/reading ", GSE_ID, " via getGEO(GSEMatrix=TRUE)")
 gse_list <- getGEO(GSE_ID, GSEMatrix = TRUE, getGPL = FALSE)
-
 gse <- gse_list[[1]]
 
-expr_mat <- exprs(gse)  # probe-level expression matrix (probes x samples)
-stopifnot(!is.null(expr_mat), nrow(expr_mat) > 0, ncol(expr_mat) > 0, !is.null(rownames(expr_mat)))
+expr_mat <- exprs(gse)
+stopifnot(
+  !is.null(expr_mat),
+  nrow(expr_mat) > 0,
+  ncol(expr_mat) > 0,
+  !is.null(rownames(expr_mat))
+)
 
 # Save phenotype metadata
 pheno_dt <- as.data.table(pData(gse), keep.rownames = TRUE)
 setnames(pheno_dt, "rn", "Sample")
 
-# ------------------------------------------------------------
-# Remove Huntington's disease samples (GSE33000 contains HD)
-# ------------------------------------------------------------
-
+# -------------------------
+# Remove Huntington's disease samples
+# -------------------------
 log_msg("Filtering out Huntington's disease samples")
-
-# collapse phenotype text for robust detection
 pheno_text <- apply(pheno_dt, 1, function(x) paste(as.character(x), collapse = " | "))
-
 hd_idx <- grepl("huntington", pheno_text, ignore.case = TRUE)
 
 if (any(hd_idx)) {
   hd_samples <- pheno_dt$Sample[hd_idx]
-  
   log_msg("HD samples detected: ", length(hd_samples))
   
-  # remove from phenotype table
   pheno_dt <- pheno_dt[!Sample %in% hd_samples]
-  
-  # remove from expression matrix
   expr_mat <- expr_mat[, !colnames(expr_mat) %in% hd_samples, drop = FALSE]
   
   log_msg("After HD removal: samples=", ncol(expr_mat))
@@ -56,85 +211,58 @@ if (any(hd_idx)) {
   log_msg("No Huntington's disease samples detected")
 }
 
-# ---- sanitize fwrite output path ----
-OUT_PHENO_CSV <- file.path("data","processed","GSE33000_pheno.csv")
-
-if (!dir.exists("data/processed")) {
-  dir.create("data/processed", recursive = TRUE)
-}
-
-# Ensure pheno_dt is a data.table
-if (!inherits(pheno_dt, "data.table")) {
-  pheno_dt <- data.table::as.data.table(pheno_dt)
-}
-data.table::fwrite(pheno_dt, file = OUT_PHENO_CSV)
+# Save phenotype + probe expression
+OUT_PHENO_CSV <- file.path("data", "processed", "GSE33000_pheno.csv")
+fwrite(pheno_dt, OUT_PHENO_CSV)
 log_msg("Saved pheno: ", OUT_PHENO_CSV)
-
-# Save probe-level expression matrix for reproducibility
-# ---- sanitize saveRDS path ----
-OUT_EXPR_PROBE_RDS <- as.character(OUT_EXPR_PROBE_RDS)[1]
-
-if (is.na(OUT_EXPR_PROBE_RDS) || !nzchar(OUT_EXPR_PROBE_RDS)) {
-  # Fallback path if setup script did not provide one
-  OUT_EXPR_PROBE_RDS <- file.path("data", "processed", "GSE33000_expr_probe.rds")
-}
-
-out_dir <- dirname(OUT_EXPR_PROBE_RDS)
-if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
 saveRDS(expr_mat, file = OUT_EXPR_PROBE_RDS)
 log_msg("Saved probe expr RDS: ", OUT_EXPR_PROBE_RDS)
 log_msg("Expr loaded: probes=", nrow(expr_mat), " samples=", ncol(expr_mat))
 
 # -------------------------
-# B) Retrieve the corresponding GPL platform
+# B) Retrieve GPL platform
 # -------------------------
 gpl_id <- annotation(gse)
-if (is.null(gpl_id) || gpl_id == "") stop("Could not detect GPL ID from GSE object.")
+if (is.null(gpl_id) || gpl_id == "") {
+  stop("Could not detect GPL ID from GSE object.")
+}
 log_msg("[2/4] Detected platform: ", gpl_id, " -> downloading GPL")
 
-gpl_obj <- getGEO(gpl_id)  # GPL platform object
+gpl_obj <- getGEO(gpl_id)
 gpl_tab <- Table(gpl_obj)
-if (is.null(gpl_tab) || nrow(gpl_tab) == 0) stop("GPL table is empty: ", gpl_id)
+if (is.null(gpl_tab) || nrow(gpl_tab) == 0) {
+  stop("GPL table is empty: ", gpl_id)
+}
 
 gpl_dt <- as.data.table(gpl_tab)
 log_msg("GPL table loaded: rows=", nrow(gpl_dt), " cols=", ncol(gpl_dt))
 
 # -------------------------
-# C) Automatically detect probe → GeneSymbol mapping columns
+# C) Build probe -> GeneSymbol map
 # -------------------------
-log_msg("[3/4] Building probe -> GeneSymbol map (auto-detect columns)")
+log_msg("[3/4] Building probe -> GeneSymbol map")
 
-# Candidate probe ID column names
 probe_col_candidates <- c("ID", "Probe ID", "ProbeID")
 probe_col <- probe_col_candidates[probe_col_candidates %in% names(gpl_dt)][1]
 if (is.na(probe_col)) {
-  # If no typical column name is found, assume the first column is probe ID
   probe_col <- names(gpl_dt)[1]
-  log_msg("WARN: probe column not found by name; fallback to first column: ", probe_col)
+  log_msg("WARN: probe column not found by standard name; using first column: ", probe_col)
 }
 
-# Gene symbol column
-symbol_col <- "ORF"
-
-if (!is.na(symbol_col)) {
-  map_dt <- gpl_dt[, .(ID_REF = as.character(get(probe_col)),
-                       GeneSymbol = as.character(get(symbol_col)))]
-} else {
-  log_msg("WARN: No obvious GeneSymbol column found in GPL. Trying regex extraction.")
-  map_dt <- gpl_dt[, .(ID_REF = as.character(get(probe_col)))]
-  map_dt[, GeneSymbol := extract_symbol_from_any(gpl_dt)]
+symbol_col <- detect_symbol_col(gpl_dt)
+if (is.na(symbol_col)) {
+  stop("Could not detect a GeneSymbol-like column in GPL table.")
 }
+log_msg("Detected gene symbol column: ", symbol_col)
 
-# Clean mapping table
-map_dt <- unique(map_dt[!is.na(ID_REF) & ID_REF != ""])
-map_dt[, GeneSymbol := trimws(GeneSymbol)]
-map_dt <- map_dt[!is.na(GeneSymbol) & GeneSymbol != ""]
+map_dt <- gpl_dt[, .(
+  ID_REF = as.character(get(probe_col)),
+  GeneSymbol = as.character(get(symbol_col))
+)]
 
-# Handle multiple gene symbols (e.g., "A /// B") by keeping the first symbol
-map_dt[, GeneSymbol := sub("\\s*///.*$", "", GeneSymbol)]
-map_dt[, GeneSymbol := sub("\\s*,.*$", "", GeneSymbol)]
-map_dt[, GeneSymbol := sub("\\s*;.*$", "", GeneSymbol)]
+map_dt[, GeneSymbol := clean_gene_symbol(GeneSymbol)]
+map_dt <- unique(map_dt[!is.na(ID_REF) & ID_REF != "" & !is.na(GeneSymbol) & GeneSymbol != ""])
 
 fwrite(map_dt, OUT_MAP_CSV)
 log_msg("Saved probe2gene map: ", OUT_MAP_CSV)
@@ -154,179 +282,65 @@ if (nrow(expr_mapped) == 0) {
   stop("No rows after mapping. Likely GPL parsing mismatch. Check OUT_MAP_CSV and probe IDs.")
 }
 
-# Sample columns correspond to expression values
 sample_cols <- setdiff(names(expr_mapped), c("ID_REF", "GeneSymbol"))
-
-# Ensure all sample columns are numeric
-for (cc in sample_cols) set(expr_mapped, j = cc, value = as.numeric(expr_mapped[[cc]]))
-
-
-# ----------------------------
-# Step A/B/C: Probe-to-gene mapping + max-variance probe collapse
-# Inputs:
-#  - expr_dt: probe-level expression table
-#  - map_dt : probe-to-gene mapping table
-# Output:
-#  - expr_gene_mat: gene-level expression matrix (genes x samples)
-# ----------------------------
-make_gene_matrix_maxvar <- function(expr_dt, map_dt) {
-  stopifnot("ID_REF" %in% names(expr_dt))
-  stopifnot(all(c("ID_REF","GeneSymbol") %in% names(map_dt)))
-  
-  # Merge probe expression with gene annotation
-  dt <- merge(
-    map_dt[, .(ID_REF = as.character(ID_REF), GeneSymbol = as.character(GeneSymbol))],
-    expr_dt,
-    by = "ID_REF",
-    all = FALSE
-  )
-  
-  # Identify sample columns
-  sample_cols <- setdiff(names(dt), c("ID_REF","GeneSymbol"))
-  for (cc in sample_cols) dt[, (cc) := as.numeric(get(cc))]
-  
-  # Select one representative probe per gene based on maximum variance
-  dt[, probe_var := apply(.SD, 1, var, na.rm = TRUE), .SDcols = sample_cols]
-  dt_best <- dt[order(-probe_var)][, .SD[1], by = GeneSymbol]
-  dt_best[, c("ID_REF","probe_var") := NULL]
-  
-  # Convert to matrix format
-  expr_gene <- as.matrix(dt_best[, ..sample_cols])
-  rownames(expr_gene) <- dt_best$GeneSymbol
-  expr_gene
+for (cc in sample_cols) {
+  data.table::set(expr_mapped, j = cc, value = as.numeric(expr_mapped[[cc]]))
 }
-
-fwrite(expr_gene_mat, OUT_EXPR_GENE_CSV)
-log_msg("Saved gene-level expression: ", OUT_EXPR_GENE_CSV)
-
-
-gene_ids <- expr_gene$GeneSymbol
-
-# Convert to numeric expression matrix
-expr_gene_mat <- as.matrix(expr_gene[, !"GeneSymbol"])
-
-# Assign gene symbols as row names
-rownames(expr_gene_mat) <- gene_ids
-
-# Force numeric storage mode
-storage.mode(expr_gene_mat) <- "double"
-
-# core_genes: feature-space genes used for PCA reduction
-reduce_core_genes_by_pca <- function(expr_gene_mat,
-                                     core_genes,
-                                     var_explained = 0.80,
-                                     target_n = 600) {
-  stopifnot(is.matrix(expr_gene_mat), !is.null(rownames(expr_gene_mat)))
-  
-  core_present <- intersect(core_genes, rownames(expr_gene_mat))
-  if (length(core_present) < 20) stop("Too few core genes present: ", length(core_present))
-  
-  # Prepare matrix for PCA (samples x genes)
-  X <- t(expr_gene_mat[core_present, , drop = FALSE])
-  
-  # ---- NA imputation before PCA ----
-  if (anyNA(X)) {
-    log_msg("NA detected in X: ", sum(is.na(X)), " -> imputing before PCA")
-    
-    if (requireNamespace("impute", quietly = TRUE)) {
-      Xt <- t(X)
-      Xt_imp <- impute::impute.knn(as.matrix(Xt))$data
-      X <- t(Xt_imp)
-      log_msg("kNN imputation done. Remaining NA: ", sum(is.na(X)))
-    } else {
-      log_msg("WARN: 'impute' package unavailable -> using median imputation")
-      gene_meds <- apply(X, 2, median, na.rm = TRUE)
-      idx <- which(is.na(X), arr.ind = TRUE)
-      X[idx] <- gene_meds[idx[, 2]]
-      log_msg("Median imputation done. Remaining NA: ", sum(is.na(X)))
-    }
-  } else {
-    log_msg("No NA in X -> skip imputation")
-  }
-  
-  # Perform PCA
-  pca <- prcomp(X, center = TRUE, scale. = TRUE)
-  
-  # Select number of PCs based on cumulative explained variance
-  ve <- (pca$sdev^2) / sum(pca$sdev^2)
-  cumve <- cumsum(ve)
-  K <- which(cumve >= var_explained)[1]
-  if (is.na(K)) K <- min(ncol(pca$x), 10)
-  
-  scores <- pca$x[, 1:K, drop = FALSE]
-  
-  # Compute R² for each gene using regression on PCA scores
-  r2 <- numeric(ncol(X))
-  for (j in seq_len(ncol(X))) {
-    y <- scale(X[, j], center = TRUE, scale = TRUE)
-    if (any(is.na(y))) { r2[j] <- NA_real_; next }
-    fit <- lm.fit(x = cbind(1, scores), y = y)
-    sse <- sum(fit$residuals^2)
-    sst <- sum((y - mean(y))^2)
-    r2[j] <- if (sst > 0) 1 - sse/sst else NA_real_
-  }
-  
-  r2_dt <- data.table(GeneSymbol = colnames(X), R2 = r2)
-  r2_dt <- r2_dt[!is.na(R2)][order(-R2)]
-  
-  # Select top genes based on R² ranking
-  target_n <- min(target_n, nrow(r2_dt))
-  selected <- r2_dt[1:target_n, GeneSymbol]
-  
-  list(
-    selected_genes = selected,
-    r2_table = r2_dt,
-    pca = pca,
-    K = K,
-    core_present = core_present
-  )
-}
-
-# Build gene expression matrix
 expr_gene_mat <- make_gene_matrix_maxvar(expr_dt, map_dt)
 stopifnot(!is.null(rownames(expr_gene_mat)))
 
-# PCA-based gene reduction
-res_red <- reduce_core_genes_by_pca(expr_gene_mat, core_genes, var_explained=0.80, target_n=600)
-selected <- res_red$selected_genes
-
-
-# Save results
 expr_gene_dt <- as.data.table(expr_gene_mat, keep.rownames = TRUE)
 setnames(expr_gene_dt, "rn", "GeneSymbol")
 fwrite(expr_gene_dt, OUT_EXPR_GENE_CSV)
-fwrite(res_red$r2_table, "data/processed/GSE33000_core_gene_R2.csv")
-fwrite(res_red$r2_table, "data/processed/GSE33000_selected_core_gene _R2.csv")
+log_msg("Saved gene-level expression: ", OUT_EXPR_GENE_CSV)
 
-log_msg("DONE. genes=", nrow(expr_gene), " samples=", length(sample_cols))
-# ---- 4) Save outputs (full gene matrix + projected/reduced matrix) ----
-if (!dir.exists("data/processed")) dir.create("data/processed", recursive = TRUE)
+# -------------------------
+# E) PCA-based reduction on core genes
+# -------------------------
+res_red <- reduce_core_genes_by_pca(
+  expr_gene_mat = expr_gene_mat,
+  core_genes = core_genes,
+  var_explained = 0.80,
+  target_n = 600
+)
+selected <- res_red$selected_genes
 
-# (A) Full gene-level expression (genes x samples)
+# -------------------------
+# F) Save outputs
+# -------------------------
 out_expr_gene_full <- file.path("data", "processed", "gse33000_expr_gene_x_sample.csv")
+out_expr_proj <- file.path("data", "processed", "gse33000_expr_projected_gene_x_sample.csv")
+out_r2 <- file.path("data", "processed", "GSE33000_core_gene_R2.csv")
+out_sel <- file.path("data", "processed", "GSE33000_selected_core_genes.txt")
+out_sel_r2 <- file.path("data", "processed", "GSE33000_selected_core_gene_R2.csv")
+
+# full gene matrix
 expr_gene_dt_full <- as.data.table(expr_gene_mat, keep.rownames = TRUE)
 setnames(expr_gene_dt_full, "rn", "GeneSymbol")
 fwrite(expr_gene_dt_full, out_expr_gene_full)
 log_msg("Saved full gene-level expression: ", out_expr_gene_full)
 
-# (B) "Projected / reduced" expression matrix (selected genes x samples)
+# projected/reduced matrix
 expr_proj_mat <- expr_gene_mat[selected, , drop = FALSE]
-out_expr_proj <- file.path("data", "processed", "gse33000_expr_projected_gene_x_sample.csv")
 expr_proj_dt <- as.data.table(expr_proj_mat, keep.rownames = TRUE)
 setnames(expr_proj_dt, "rn", "GeneSymbol")
 fwrite(expr_proj_dt, out_expr_proj)
 log_msg("Saved projected/reduced expression: ", out_expr_proj, " (genes=", nrow(expr_proj_mat), ")")
 
-# (C) R2 table
-out_r2 <- file.path("data", "processed", "GSE33000_core_gene_R2.csv")
+# R2 tables
 fwrite(res_red$r2_table, out_r2)
 log_msg("Saved R2 table: ", out_r2)
 
-# (D) Selected gene list
-out_sel <- file.path("data", "processed", "GSE33000_selected_core_genes.txt")
+sel_r2 <- res_red$r2_table[GeneSymbol %in% selected]
+fwrite(sel_r2, out_sel_r2)
+log_msg("Saved selected-gene R2 table: ", out_sel_r2)
+
+# selected gene list
 writeLines(selected, out_sel)
 log_msg("Saved selected core genes: ", out_sel)
 
-log_msg("DONE. genes(full)=", nrow(expr_gene_mat),
-        " genes(projected)=", nrow(expr_proj_mat),
-        " samples=", ncol(expr_gene_mat))
+log_msg(
+  "DONE. genes(full)=", nrow(expr_gene_mat),
+  " genes(projected)=", nrow(expr_proj_mat),
+  " samples=", ncol(expr_gene_mat)
+)
