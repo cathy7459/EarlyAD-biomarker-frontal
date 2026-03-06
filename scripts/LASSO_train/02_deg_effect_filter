@@ -1,39 +1,117 @@
 source("scripts/00_setup.R")
 
-expr_path <- file.path(DIR_DATA_PROCESSED, "gse33000_expr_gene_x_sample.csv")
-if (!file.exists(expr_path)) stop("Run scripts/01_build_expr_gse33000.R first: missing ", expr_path)
+# ------------------------------------------------------------
+# 02_deg_effect_filter.R
+# - Input: projected/reduced expression matrix from script 01
+# - Run limma DEG (AD vs Control)
+# - Apply effect-size filter (logFC cutoff) for batch/noise robustness
+# ------------------------------------------------------------
+
+# Prefer projected matrix (post-projection / reduced feature space)
+expr_path_proj <- file.path(out_expr_proj)
+expr_path_full <- file.path(out_expr_gene_full)
+
+expr_path <- if (file.exists(expr_path_proj)) expr_path_proj else expr_path_full
+if (!file.exists(expr_path)) {
+  stop("Missing expression input. Run script 01 first.\nExpected: ", expr_path_proj, " or ", expr_path_full)
+}
 
 log_msg("[2/3] Loading expression: ", expr_path)
 expr_dt <- fread(expr_path)
 stopifnot("GeneSymbol" %in% names(expr_dt))
+
 expr <- as.data.frame(expr_dt[, -1])
 rownames(expr) <- expr_dt$GeneSymbol
-
-# ---- sample metadata ----
-if (!file.exists(GSE33000_SAMPLE_META_CSV)) {
+# -------------------------
+# Sample metadata (AD/Control)
+# -------------------------
+pheno_path <- file.path(DIR_DATA_PROCESSED, "GSE33000_pheno.csv")
+if (!file.exists(pheno_path)) {
   stop(
-    "Sample metadata file not found: ", GSE33000_SAMPLE_META_CSV, "\n",
-    "Create it with columns: sample_id, condition (AD/Control).\n",
-    "Tip: sample_id should match expression column names exactly."
+    "Missing pheno export: ", pheno_path, "\n",
+    "Provide a CSV with columns: sample_id, condition (AD/Control)."
   )
 }
-meta <- fread(GSE33000_SAMPLE_META_CSV)
-meta <- as.data.frame(meta)
 
-# Ensure order matches expression
-meta <- meta[match(colnames(expr), meta$sample_id), , drop = FALSE]
-if (anyNA(meta$sample_id)) stop("sample_metadata does not match expression columns.")
+log_msg("[2/3] Building sample metadata from: ", pheno_path)
+ph <- fread(pheno_path)
 
+if (!("Sample" %in% names(ph))) {
+  stop("Pheno file must contain 'Sample' column: ", pheno_path)
+}
+if (!("disease status:ch2" %in% names(ph))) {
+  stop("Pheno file must contain 'disease status:ch2' column: ", pheno_path)
+}
+
+cond_vec <- trimws(as.character(ph[["disease status:ch2"]]))
+
+# check raw labels first
+log_msg("Raw disease labels:")
+print(table(cond_vec, useNA = "ifany"))
+
+condition <- ifelse(
+  grepl("^Alzheimer's disease$", cond_vec, ignore.case = TRUE), "AD",
+  ifelse(
+    grepl("^non-demented$", cond_vec, ignore.case = TRUE), "Control",
+    NA_character_
+  )
+)
+
+meta <- data.frame(
+  sample_id = as.character(ph$Sample),
+  condition = condition,
+  stringsAsFactors = FALSE
+)
+
+# keep only AD / Control
+meta <- meta[!is.na(meta$condition), , drop = FALSE]
+
+# overwrite old cached metadata
+fwrite(as.data.table(meta), GSE33000_SAMPLE_META_CSV)
+log_msg("Saved metadata: ", GSE33000_SAMPLE_META_CSV)
+log_msg("Condition counts:")
+print(table(meta$condition, useNA = "ifany"))
+
+# Ensure order matches expression columns
+# Keep only AD/Control-labeled samples
+# Ensure order matches expression columns
+common_samples <- intersect(colnames(expr), meta$sample_id)
+
+if (length(common_samples) < 20) {
+  stop("Too few matched AD/Control samples after metadata filtering: ", length(common_samples))
+}
+
+expr <- expr[, common_samples, drop = FALSE]
+meta <- meta[match(common_samples, meta$sample_id), , drop = FALSE]
+
+stopifnot(identical(colnames(expr), meta$sample_id))
+
+log_msg("Matched AD/Control samples: ", length(common_samples))
+log_msg("AD samples: ", sum(meta$condition == "AD"))
+log_msg("Control samples: ", sum(meta$condition == "Control"))
+log_msg("Dropped unlabeled/non-AD-control samples: ",
+        length(setdiff(colnames(expr_dt)[-1], common_samples)))
+
+# final sanity check before limma
+if (length(unique(meta$condition)) != 2) {
+  stop(
+    "Metadata must contain exactly two groups for limma DEG.\n",
+    "Observed counts:\n",
+    paste(capture.output(print(table(meta$condition, useNA = 'ifany'))), collapse = "\n")
+  )
+}
 log_msg("[2/3] Running limma DEG ...")
 deg <- run_limma_deg(expr, meta, condition_col = "condition")
 
-out_deg <- file.path(DIR_OUT_TABLES, "deg_gse33000.csv")
+out_deg <- file.path(DIR_OUT_TABLES, "deg_gse33000_postproj.csv")
 fwrite(deg, out_deg)
 log_msg("Saved: ", out_deg)
 
-# Effect-size filtering
+# -------------------------
+# Effect-size filtering (robust to batch/noise after projection)
+# -------------------------
 deg_f <- deg[adj.P.Val < FDR_CUTOFF & abs(logFC) > LOGFC_CUTOFF]
-out_deg_f <- file.path(DIR_OUT_TABLES, "deg_filtered_genes.csv")
+out_deg_f <- file.path(DIR_OUT_TABLES, "deg_filtered_genes_postproj.csv")
 fwrite(deg_f, out_deg_f)
 log_msg("Saved: ", out_deg_f)
 
@@ -43,4 +121,4 @@ expr_f <- expr[keep, , drop = FALSE]
 out_expr_f <- file.path(DIR_DATA_PROCESSED, "gse33000_expr_filtered_gene_x_sample.csv")
 fwrite(as.data.table(expr_f, keep.rownames = "GeneSymbol"), out_expr_f)
 log_msg("Saved: ", out_expr_f)
-log_msg("Filtered genes: ", nrow(expr_f))
+log_msg("Filtered genes (post-proj): ", nrow(expr_f))
