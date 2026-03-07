@@ -1,5 +1,6 @@
-# scripts/03_lasso_train_validate.R
-source(file.path("scripts/LASSO_train/00_setup.R"))
+
+# scripts/03_lasso_train.R
+source(file.path("scripts", "00_setup.R"))
 
 log_msg("RUNNING FILE: scripts/03_lasso_train_validate.R")
 
@@ -137,6 +138,17 @@ if (any(!is.finite(x))) {
 
 log_msg("[3/4] LASSO input ready: samples=", nrow(x), " genes=", ncol(x))
 
+# Save train statistics for external validation
+feature_medians <- apply(x, 2, median, na.rm = TRUE)
+feature_means <- colMeans(x, na.rm = TRUE)
+feature_sds <- apply(x, 2, sd, na.rm = TRUE)
+
+# safety
+feature_medians[!is.finite(feature_medians)] <- 0
+feature_means[!is.finite(feature_means)] <- 0
+feature_sds[!is.finite(feature_sds) | feature_sds == 0] <- 1
+
+
 # ------------------------------------------------------------
 # 4) Train cv.glmnet
 # ------------------------------------------------------------
@@ -224,36 +236,36 @@ log_msg("Training AUC: ", sprintf("%.3f", auc_val))
 log_msg("DONE. samples=", nrow(x), " genes=", ncol(x), " selected=", nrow(sel_dt))
 
 # ------------------------------------------------------------
-# ROC curve (training)
+# 7) Save model bundle for external validation
 # ------------------------------------------------------------
+bundle_prefix <- if (exists("CFG") && !is.null(CFG$prefix)) CFG$prefix else "ad_lasso"
+out_bundle <- file.path("outputs", paste0(bundle_prefix, "_model_bundle.rds"))
 
-library(pROC)
-
-prob_train <- as.numeric(predict(cvfit, newx = x, s = lam, type = "response"))
-
-roc_obj <- roc(response = y_bin, predictor = prob_train)
-
-auc_val <- auc(roc_obj)
-
-# Plot
-plot(
-  roc_obj,
-  col = "#2C7BB6",
-  lwd = 3,
-  main = paste0("Training ROC Curve (AUC = ", round(auc_val,3), ")")
+bundle <- list(
+  created_at = Sys.time(),
+  script = "03_lasso_train_validate.R",
+  
+  cvfit = cvfit,
+  lambda_use = lam,
+  lambda_mode = USE_LAMBDA,
+  
+  genes_used = colnames(x),
+  selected = sel_dt,
+  coef_table = coef_dt,
+  
+  feature_medians = feature_medians,
+  feature_means = feature_means,
+  feature_sds = feature_sds,
+  
+  n_samples = nrow(x),
+  n_genes = ncol(x),
+  sample_ids = rownames(x),
+  y_train = y_bin,
+  y_train_chr = as.character(y),
+  
+  seed = SEED,
+  cv_folds = CV_FOLDS
 )
 
-abline(a = 0, b = 1, lty = 2, col = "gray")
-
-png("outputs/figures/roc_train.png", width = 1800, height = 1600, res = 220)
-
-plot(
-  roc_obj,
-  col = "#2C7BB6",
-  lwd = 3,
-  main = paste0("Training ROC Curve (AUC = ", round(auc_val,3), ")")
-)
-
-abline(a = 0, b = 1, lty = 2, col = "gray")
-
-dev.off()
+saveRDS(bundle, out_bundle)
+log_msg("Saved model bundle: ", out_bundle)
