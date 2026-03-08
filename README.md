@@ -17,10 +17,6 @@ The goal is to identify **cross-platform consensus genes consistently detected a
 
 ---
 
-## Pipeline overview
-
-![Pipeline](figures/pipeline.png)
-
 # Overview
 
 Early detection of Alzheimer’s disease remains a major challenge.
