@@ -48,7 +48,8 @@ AD vs AsymAD
 
 The preclinical core genes were defined as:
 
-```PCGS = DEG(AsymAD vs Control)
+```
+PCGS = DEG(AsymAD vs Control)
 ∩ (DEG(AD vs Control) ∪ DEG(AD vs AsymAD))
 ```
 
@@ -185,6 +186,7 @@ Outputs will be written to:
 outputs/
 ```
 
+```
 ## Key findings
 
 The temporal cortex showed stronger diagnostic signals than the frontal cortex.
