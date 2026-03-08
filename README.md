@@ -178,7 +178,7 @@ if (!requireNamespace("BiocManager", quietly=TRUE))
 
 BiocManager::install(c("GEOquery","limma","WGCNA"))
 
-
+```
 # Running the pipeline
 ```
 Rscript scripts/run_all.R
@@ -186,7 +186,6 @@ Outputs will be written to:
 outputs/
 ```
 
-```
 ## Key findings
 
 The temporal cortex showed stronger diagnostic signals than the frontal cortex.
