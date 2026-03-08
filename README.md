@@ -169,3 +169,27 @@ if (!requireNamespace("BiocManager", quietly=TRUE))
 
 BiocManager::install(c("GEOquery","limma","WGCNA"))
 
+
+# Running the pipeline
+Rscript scripts/run_all.R
+Outputs will be written to:
+outputs/
+
+## Key findings
+
+The temporal cortex showed stronger diagnostic signals than the frontal cortex.
+
+3 frontal hub genes and 9 temporal hub genes were consistently detected across independent datasets.
+
+External validation achieved AUC up to 0.94.
+
+Cross-platform validation confirmed robust biomarkers across bulk and single-cell transcriptomic datasets.
+
+## Reproducibility
+
+All parameters are defined in config/config.R
+
+Raw data are not stored in the repository
+
+GEO datasets can be downloaded from: https://www.ncbi.nlm.nih.gov/geo/
+
