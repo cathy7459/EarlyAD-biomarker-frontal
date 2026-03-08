@@ -1,221 +1,171 @@
-[README.md](https://github.com/user-attachments/files/25660043/README.md)[README.md](https://github.com/user-attachments/files/25644238/README.md)# EarlyAD-biomarker-PCA-WGCNA
-Reproducible transcriptomic pipeline for early AD biomarker discovery using PCA expansion and WGCNA.
-#PCGS README
-[README.md](https://github.com/user-attachments/files/25642571/README.md)
-# PCGS (Preclinical Core Gene Set) — GSE118553 (Frontal)
+# Early-stage Alzheimer’s biomarker discovery using integrative transcriptomic modeling
 
-This repo contains a cleaned, reproducible R pipeline to:
+This repository provides a **reproducible bioinformatics pipeline** for identifying robust early-stage Alzheimer’s disease (AD) biomarkers using integrative analysis of multiple transcriptomic datasets.
 
-1. Download **GSE118553** from GEO
-2. Keep **frontal** region samples
-3. Run **limma** differential expression for 3 contrasts
-4. Define a **preclinical core** set:
+The workflow combines:
 
-   `core = DEG(AsymAD vs Control) ∩ (DEG(AD vs Control) ∪ DEG(AD vs AsymAD))`
+- differential expression analysis
+- PCA-guided gene expansion
+- network filtering using WGCNA
+- Elastic Net feature selection
+- cross-platform validation with single-nucleus RNA sequencing
 
-5. Map **probe → gene symbol** using the platform (GPL) annotation and collapse probes to genes
-6. Export core gene expression matrices
-7. Expand the feature space using **PCA expansion** (max |cor| with selected PCs)
-
-## Files
-
-- `scripts/run_pcgs_frontal.R` — main pipeline script (edit parameters at the top)
-- `R/utils.R` — helper functions
-- `outputs/` — default output folder (generated)
-
-## Requirements
-
-R packages:
-
-- GEOquery
-- limma
-- matrixStats
-- dplyr
-- stringr
-- tibble
-
-Install (example):
-
-```r
-install.packages(c("dplyr","stringr","tibble","matrixStats"))
-if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
-BiocManager::install(c("GEOquery","limma"))
-```
-
-## Run
-
-From repo root:
-
-```bash
-Rscript scripts/run_pcgs_frontal.R
-```
-
-Outputs are written to `outputs/`.
-
-## Key outputs
-
-- `deg_AsymAD_vs_Control.tsv`
-- `deg_AD_vs_Control.tsv`
-- `deg_AD_vs_AsymAD.tsv`
-- `core_probes.txt`, `core_genes.txt`
-- `core_expression_gene_x_sample.csv`
-- `expanded_genes.txt`
-- `expanded_expression_gene_x_sample.csv`
-- `pcgs_frontal_pipeline.rds`
-
-## Notes
-
-- Region matching uses a regex (`frontal|pfc|prefrontal|dlpfc|dorsolateral`). If your `pData` uses different naming, change `frontal_regex`.
-- The pipeline keeps logic explicit and avoids overwriting objects in-place (one of the biggest readability issues in the original script).
-
-# PCA and WGCNA
-#[Uploadin# GSE118553 PCA expansion + WGCNA (cleaned)
-
-This repository is a cleaned, GitHub-friendly refactor of your original script:
-`original/PCA_expansion_and_WGCNA_gse118553.R`.
-
-## What this repo does
-1. **PCA expansion**: starting from a *core gene set*, it expands to a capped gene set (default 800) using:
-   - simple correlations to selected PCs
-   - partial correlations (PCk controlling other PCs)
-   - AND filter across ≥ `m` PCs, then hard-cap by a combined score
-
-2. **WGCNA**: runs a signed WGCNA on the (expanded) gene set and saves:
-   - gene → module mapping
-   - module eigengenes
-   - a bundled RDS of the full results
-
-## What you must provide upstream
-This repo intentionally **does not** re-download GEO data (so it's fast and modular).
-Before running, create these objects in your environment:
-
-- `expr_mapped` : probe-level expression matrix (probes x samples)
-- `map_df`      : mapping table with column `symbol` (gene symbol) aligned to `expr_mapped` rows
-- `expr_gene`   : **core gene** expression matrix (genes x samples), used to fix sample order
-- `core_features` : character vector of core gene symbols
-- (optional) `group_f` : labels for each sample (names must be sample IDs)
-
-## Run
-After your preprocessing script has created the objects above:
-
-```r
-source("scripts/run_all.R")
-```
-
-Outputs are written to `outputs/`.
-
-## Outputs
-- `outputs/expanded_genes.txt`
-- `outputs/expanded_expression_gene_x_sample.csv`
-- `outputs/pca_expansion_diagnostics.rds`
-- `outputs/WGCNA_GeneModuleMap.csv`
-- `outputs/WGCNA_ModuleEigengenes.csv`
-- `outputs/WGCNA_results.rds`
-- (optional) `outputs/WGCNA_ME_trait_correlation.tsv` (+ pvalues)
-
-## Tuning
-Edit parameters at the top of `scripts/01_pca_expansion.R` and `scripts/02_wgcna.R`:
-- PCA expansion: `K_fixed`, `drop_PC1`, `m_and`, `target_max`
-- WGCNA: `minModuleSize`, `mergeCutHeight`, `networkType`
+The goal is to identify **cross-platform consensus genes that are consistently detected across independent transcriptomic datasets.**
 
 ---
-If you want, I can also:
-- add `optparse` CLI (`--target_max 800` etc.)
-- add `renv` to lock package versions for full reproducibility
-g README.md…]()
 
-#LASSO
-[README.md](https://github.com/user-attachments/files/25659777/README.md)
-# LASSO pipeline (GSE33000) — paper-ready scaffold
+# Overview
 
-This repository contains a **reproducible** (paper-style) pipeline to:
+Early detection of Alzheimer’s disease remains a major challenge.  
+This project aims to identify **robust transcriptomic biomarkers associated with early-stage AD progression** by integrating multiple GEO datasets and validating findings across different platforms.
 
-1) build a **gene × sample** expression matrix for **GSE33000** from the GEO series matrix  
-2) map probes → gene symbols (GPL4372) and **collapse multiple probes per gene**  
-3) run **effect-size filtering** (limma; |logFC| + FDR) to define a stable feature set  
-4) train a **binomial LASSO** model (glmnet) and (optionally) validate on another GEO dataset
+The pipeline consists of three main stages:
 
-> Raw data are not stored in this repository. Place downloaded files under `data/raw/`.
+1. **Bulk transcriptomic biomarker discovery**
+2. **Machine-learning based feature selection**
+3. **Cross-platform validation using single-nucleus RNA-seq**
 
-## Quick start
+---
 
-### 0) Requirements
-- R >= 4.2
-- Packages: `data.table`, `GEOquery`, `limma`, `glmnet`, `pROC`
+# Pipeline
 
-### 1) Put inputs in place
-Create folders locally (they are gitignored):
-- `data/raw/`  
-- `data/processed/`  
-- `outputs/`
+## 1. Bulk transcriptomic biomarker discovery
 
-Place:
-- `data/raw/GSE33000_series_matrix.txt.gz`
-- (optional) a validation series matrix: e.g. `data/raw/GSE44770_series_matrix.txt.gz`
-- a core gene list CSV: `data/processed/core_genes.csv` with a column **GeneSymbol**
+Dataset: GSE118553
 
-If you **cannot** reliably infer case/control labels from GEO metadata, create:
-- `data/processed/sample_metadata_gse33000.csv` with columns:
-  - `sample_id` (e.g., GSMxxxxxxx matching series matrix columns)
-  - `condition` (values: `AD` or `Control`)
 
-### 2) Run everything
-From the repo root:
-```bash
-Rscript scripts/run_all.R
-```
+Steps:
 
-## Outputs
-- `data/processed/gse33000_expr_gene_x_sample.csv`
-- `outputs/tables/deg_gse33000.csv`
-- `outputs/tables/deg_filtered_genes.csv`
-- `outputs/tables/lasso_selected_genes.csv`
-- `outputs/figures/roc_train.png` (+ optional validation ROC)
+### Differential expression analysis
 
-## Reproducibility notes
-- All file paths and thresholds are centralized in `config/config.R`.
-- The pipeline is split into small scripts under `scripts/` and reusable functions under `R/`.
+Three contrasts were tested using **limma**: 
+AsymAD vs Control
+AD vs Control
+AD vs AsymAD
 
-## Original script
-See `original/LASSO with gse33000_1.R` for the unrefactored source.
 
-#LASSO TEST
-[Uploa# GSE33000 → LASSO (train) → GSE122063 (test)
+### Preclinical Core Gene Set (PCGS)
 
-Paper-ready, reproducible R pipeline for training a LASSO logistic regression model on **GSE33000** and evaluating on **GSE122063**.
+The preclinical core genes were defined as:
+PCGS = DEG(AsymAD vs Control)
+∩ (DEG(AD vs Control) ∪ DEG(AD vs AsymAD))
 
-## What this repo does
-1. **TRAIN (GSE33000)**: parse `series_matrix.txt.gz` → probe→gene mapping with **GPL4372** → gene-level collapse (max variance probe) → label AD/Control (exclude HD).
-2. **TEST (GSE122063)**: `getGEO()` → platform mapping → gene-level collapse (max variance probe) → label AD/Control (exclude vascular dementia).
-3. **MODEL**: z-score standardization using **train** mean/sd → `cv.glmnet(family="binomial")` → ROC/AUC on train & test → selected genes.
 
-## Inputs (NOT stored in git)
-Place these locally (see `.gitignore`):
-- `data/raw/GSE33000_series_matrix.txt.gz`
-- (optional) `data/processed/core_genes.csv`  (any of these columns accepted: `GeneSymbol`, `gene`, `symbol`, `hgnc_symbol`, `gene_symbol`)
+These genes represent **early transcriptional changes associated with AD progression.**
 
-## Configure
-Edit:
-- `config/config.R`
+---
 
-## Run
-From repo root:
-```bash
-Rscript scripts/run_all.R
-```
+### PCA-based dimensionality reduction
 
-## Outputs
-Saved to `outputs/`:
-- `outputs/tables/*_selected_genes.csv`
-- `outputs/tables/*_all_coefficients.csv`
-- `outputs/tables/*_performance.csv`
-- `outputs/figures/*_roc_train.png`
-- `outputs/figures/*_roc_test.png`
-- `outputs/figures/*_coef_path.png`
-- `outputs/*_model_bundle.rds`
+Principal component analysis was first applied to identify major transcriptional axes.
 
-## Provenance
-The original single-file script is preserved in `original/`.
-ding README.md…]()
+The PCA step serves two purposes:
 
+1. **Dimensionality reduction**
+2. Extraction of **PC loadings representing major biological variation**
+
+---
+
+### PCA-guided gene expansion
+
+Genes highly correlated with selected PCs were added to the feature space.
+
+This step expands the PCGS to capture genes that are **co-regulated with early AD transcriptional programs.**
+
+---
+
+### Network filtering using WGCNA
+
+The expanded gene set was further filtered using **Weighted Gene Co-expression Network Analysis (WGCNA)**.
+
+This step identifies **co-expression modules associated with disease progression** and removes noise genes.
+
+The resulting set is referred to as the: Preclinical Core Gene Network
+
+
+---
+
+## 2. Independent dataset projection and machine learning
+
+Training datasets: GSE33000, GSE132903
+
+Steps:
+
+1. Projection of candidate genes onto independent bulk datasets
+2. Probe-to-gene mapping and gene-level expression collapse
+3. Data standardization using training statistics
+4. **Feature selection using Elastic Net logistic regression**
+5. Model training and performance evaluation
+
+Elastic Net was used instead of LASSO to account for **correlated gene expression features.**
+
+---
+
+### External validation
+
+The trained model was evaluated on: GSE122063
+
+
+Model performance was measured using **ROC curves and AUC scores**.
+
+---
+
+## 3. Cross-platform validation using single-nucleus RNA-seq
+
+Datasets: GSE188545, GSE243292
+
+
+Steps:
+
+1. Projection of bulk-derived hub genes onto snRNA-seq datasets
+2. Hub gene filtering to minimize technical noise
+3. **LOOCV-based hub score evaluation**
+4. Independent external validation using: GSE5281
+
+
+---
+
+## 4. Final biomarker identification
+
+Genes detected consistently across bulk transcriptomic datasets and single-cell validation were defined as: Cross-platform consensus genes
+
+
+These genes represent **robust early-stage Alzheimer’s disease biomarkers.**
+
+---
+
+# Repository structure
+
+
+
+
+---
+
+# Requirements
+
+R ≥ 4.2
+
+Required packages:
+GEOquery
+limma
+WGCNA
+glmnet
+pROC
+data.table
+matrixStats
+dplyr
+tibble
+stringr
+
+
+
+Install example:
+
+```r
+install.packages(c("data.table","dplyr","tibble","stringr","matrixStats"))
+
+if (!requireNamespace("BiocManager", quietly=TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("GEOquery","limma","WGCNA"))
 
