@@ -1,62 +1,276 @@
-# 03_test_gse122063.R
-log_msg("=== TEST: ", CFG$test_gse_id, " ===")
+# scripts/04_prepare_external_test_set.R
+# source("config/config.R")
+# source("scripts/00_split_gse122063_by_region_and_diagnosis.R")
 
-gse_obj <- getGEO(CFG$test_gse_id, GSEMatrix = TRUE)
-if (length(gse_obj) > 1) {
-  # choose the first by default; user can change if needed
-  log_msg("[Test] multiple ExpressionSets found: ", length(gse_obj), " -> using first. If wrong, edit scripts/03_test_gse122063.R")
-  eset <- gse_obj[[1]]
-} else {
-  eset <- gse_obj[[1]]
+CFG$test_region <- "frontal"   
+
+log_msg("=== PREPARE EXTERNAL TEST SET FROM PRE-SPLIT OBJECTS: ", CFG$test_gse_id, " ===")
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+if (!exists("state")) state <- new.env(parent = emptyenv())
+
+# ------------------------------------------------------------
+# 0) Required inputs
+# ------------------------------------------------------------
+if (is.null(CFG$model_bundle_rds) || !file.exists(CFG$model_bundle_rds)) {
+  stop("Model bundle not found: ", CFG$model_bundle_rds)
 }
 
-expr_probe <- exprs(eset)  # probes x samples
-test_samples <- colnames(expr_probe)
+dir.create(file.path(CFG$out_dir, "tables"), recursive = TRUE, showWarnings = FALSE)
 
-# phenotype
-ph <- pData(eset)
-if (!(CFG$test_diag_col %in% colnames(ph))) {
-  # try case-insensitive match
-  hit <- colnames(ph)[tolower(colnames(ph)) == tolower(CFG$test_diag_col)]
+# which split to use: "frontal" or "temporal"
+if (!exists("TEST_REGION_USE")) {
+  TEST_REGION_USE <- if (!is.null(CFG$test_region) && nzchar(CFG$test_region)) {
+    tolower(CFG$test_region)
+  } else {
+    "frontal"
+  }
+}
+if (!TEST_REGION_USE %in% c("frontal", "temporal")) {
+  stop("TEST_REGION_USE (or CFG$test_region) must be 'frontal' or 'temporal'.")
+}
+
+log_msg("[Test] region selected for preparation: ", TEST_REGION_USE)
+
+# ------------------------------------------------------------
+# 1) Load trained model bundle
+# ------------------------------------------------------------
+bundle <- readRDS(CFG$model_bundle_rds)
+
+if (!is.null(bundle$genes_used)) {
+  genes_used <- as.character(bundle$genes_used)
+} else if (!is.null(bundle$common_genes)) {
+  genes_used <- as.character(bundle$common_genes)
+} else {
+  stop("No genes_used/common_genes found in model bundle.")
+}
+
+genes_used <- unique(genes_used[!is.na(genes_used) & genes_used != ""])
+if (length(genes_used) < 2) stop("Too few genes in model bundle.")
+
+log_msg("[Bundle] genes used in trained model: ", length(genes_used))
+
+# ------------------------------------------------------------
+# 2) Load train-side imputation stats from model bundle
+# ------------------------------------------------------------
+if (is.null(bundle$feature_medians)) {
+  stop("feature_medians missing in model bundle.")
+}
+
+train_gene_medians <- bundle$feature_medians[genes_used]
+train_gene_medians[is.na(train_gene_medians) | !is.finite(train_gene_medians)] <- 0
+
+log_msg("[Train stats] loaded train medians from model bundle for ", length(genes_used), " genes")
+
+# ------------------------------------------------------------
+# 3) Get pre-split region-specific objects from state
+# ------------------------------------------------------------
+if (TEST_REGION_USE == "frontal") {
+  required_objs <- c(
+    !is.null(state$gse122063_frontal_expr_probe),
+    !is.null(state$gse122063_frontal_expr_gene_gxs),
+    !is.null(state$gse122063_frontal_meta)
+  )
+  
+  if (!all(required_objs)) {
+    stop(
+      "Frontal split objects not found in state.\n",
+      "Run scripts/00_split_gse122063_by_region_and_diagnosis.R first."
+    )
+  }
+  
+  expr_probe_sub <- state$gse122063_frontal_expr_probe
+  expr_gene_gxs <- state$gse122063_frontal_expr_gene_gxs
+  meta_sub <- state$gse122063_frontal_meta
+  
+} else {
+  required_objs <- c(
+    !is.null(state$gse122063_temporal_expr_probe),
+    !is.null(state$gse122063_temporal_expr_gene_gxs),
+    !is.null(state$gse122063_temporal_meta)
+  )
+  
+  if (!all(required_objs)) {
+    stop(
+      "Temporal split objects not found in state.\n",
+      "Run scripts/00_split_gse122063_by_region_and_diagnosis.R first."
+    )
+  }
+  
+  expr_probe_sub <- state$gse122063_temporal_expr_probe
+  expr_gene_gxs <- state$gse122063_temporal_expr_gene_gxs
+  meta_sub <- state$gse122063_temporal_meta
+}
+
+log_msg("[Test] using pre-split ", TEST_REGION_USE, " subset from state")
+log_msg("[Test] probe-level subset: ", nrow(expr_probe_sub), " probes x ", ncol(expr_probe_sub), " samples")
+log_msg("[Test] gene-level subset: ", nrow(expr_gene_gxs), " genes x ", ncol(expr_gene_gxs), " samples")
+
+# ------------------------------------------------------------
+# 4) Build labels from metadata
+# ------------------------------------------------------------
+if (!(CFG$test_diag_col %in% colnames(meta_sub))) {
+  hit <- colnames(meta_sub)[tolower(colnames(meta_sub)) == tolower(CFG$test_diag_col)]
   if (length(hit) == 1) {
     CFG$test_diag_col <- hit
   } else {
-    stop("Test diagnosis column not found in pData. Wanted: ", CFG$test_diag_col, " . Available: ", paste(colnames(ph), collapse=", "))
+    stop(
+      "Diagnosis column not found in pre-split metadata. Wanted: ", CFG$test_diag_col,
+      " | Available: ", paste(colnames(meta_sub), collapse = ", ")
+    )
   }
 }
 
-diag_raw <- as.character(ph[[CFG$test_diag_col]])
-diag_lc <- tolower(diag_raw)
+diag_sub_raw <- as.character(meta_sub[[CFG$test_diag_col]])
+diag_sub_lc <- trimws(tolower(diag_sub_raw))
 
-# Exclude vascular dementia; keep AD/Control
-is_vascular <- grepl("vascular", diag_lc)
-is_ad <- grepl("alzheimer|ad", diag_lc) & !is_vascular
-is_ctrl <- grepl("control|normal|healthy", diag_lc) & !is_vascular
+valid_diag <- diag_sub_lc %in% c("alzheimer's disease", "control")
+if (!all(valid_diag)) {
+  bad_labels <- unique(diag_sub_raw[!valid_diag])
+  stop(
+    "Pre-split metadata contains unexpected labels in selected region: ",
+    paste(bad_labels, collapse = ", ")
+  )
+}
 
-keep <- which(is_ad | is_ctrl)
-if (length(keep) < 10) stop("Too few labeled samples in test after filtering AD/Control. Check diagnosis parsing.")
-
-state$test_samples <- test_samples[keep]
-state$y_test_chr <- ifelse(is_ad[keep], "AD", "Control")
+state$test_samples <- colnames(expr_probe_sub)
+state$y_test_chr <- ifelse(diag_sub_lc == "alzheimer's disease", "AD", "Control")
 state$y_test <- ifelse(state$y_test_chr == "AD", 1, 0)
 
-expr_probe_sub <- expr_probe[, state$test_samples, drop=FALSE]
+log_msg("[Test] kept ", TEST_REGION_USE, " samples: ", length(state$test_samples),
+        " (AD=", sum(state$y_test == 1),
+        ", Control=", sum(state$y_test == 0), ")")
 
-# platform mapping for test set
-platform_id <- annotation(eset)
-if (is.null(platform_id) || platform_id == "") {
-  # fallback: try from metadata
-  platform_id <- as.character(experimentData(eset)@annotation)
+# ------------------------------------------------------------
+# 5) Align test gene matrix to exact trained feature space
+# ------------------------------------------------------------
+test_gene_mat <- expr_gene_gxs
+storage.mode(test_gene_mat) <- "double"
+
+test_aligned <- matrix(
+  NA_real_,
+  nrow = length(genes_used),
+  ncol = ncol(test_gene_mat),
+  dimnames = list(genes_used, colnames(test_gene_mat))
+)
+
+matched_test_genes <- intersect(genes_used, rownames(test_gene_mat))
+missing_test_genes <- setdiff(genes_used, rownames(test_gene_mat))
+
+if (length(matched_test_genes) > 0) {
+  test_aligned[matched_test_genes, ] <- test_gene_mat[matched_test_genes, , drop = FALSE]
 }
-if (is.null(platform_id) || platform_id == "") stop("Cannot determine platform ID for test ExpressionSet.")
 
-log_msg("[Test] platform detected: ", platform_id)
+missing_frac <- length(missing_test_genes) / length(genes_used)
 
-test_anno <- get_probe_gene_mapping(platform_id)
+log_msg("[Test] aligned genes: matched=", length(matched_test_genes),
+        " missing=", length(missing_test_genes),
+        " total=", length(genes_used))
+log_msg("[Test] missing gene fraction: ", round(missing_frac, 4))
 
-# collapse to gene
-test_collapsed <- collapse_to_gene_maxvar(expr_probe_sub, test_anno, keep_genes = state$core_genes)
-state$test_gene_mat_gxs <- test_collapsed$expr_gene
-log_msg("[Test] gene-matrix: ", nrow(state$test_gene_mat_gxs), " genes x ", ncol(state$test_gene_mat_gxs), " samples")
+if (missing_frac > 0.2) {
+  warning("More than 20% of model genes are missing in test set; downstream prediction may be unreliable.")
+}
 
-log_msg("[Test] final labeled samples: ", length(state$test_samples), " (AD=", sum(state$y_test==1), ", Control=", sum(state$y_test==0), ")")
+# ------------------------------------------------------------
+# 6) Median imputation using TRAIN medians
+# ------------------------------------------------------------
+na_before <- sum(is.na(test_aligned))
+if (na_before > 0) {
+  log_msg("[Test] NA detected before imputation: ", na_before)
+  
+  for (g in seq_len(nrow(test_aligned))) {
+    idx <- is.na(test_aligned[g, ])
+    if (any(idx)) {
+      test_aligned[g, idx] <- train_gene_medians[g]
+    }
+  }
+}
+
+na_after <- sum(is.na(test_aligned))
+if (na_after > 0) {
+  stop("NA remains in test matrix after train-median imputation: ", na_after)
+}
+
+# ------------------------------------------------------------
+# 7) Build sample x gene matrix for downstream prediction
+# ------------------------------------------------------------
+X_test <- t(test_aligned)
+storage.mode(X_test) <- "double"
+
+if (any(!is.finite(X_test))) {
+  bad_idx <- which(!is.finite(X_test), arr.ind = TRUE)
+  print(head(bad_idx, 20))
+  stop("Non-finite values detected in X_test.")
+}
+
+log_msg("[Test] prepared X_test: ", nrow(X_test), " samples x ", ncol(X_test), " genes")
+
+# ------------------------------------------------------------
+# 8) Save outputs (preparation only)
+# ------------------------------------------------------------
+region_tag <- paste0(TEST_REGION_USE, "_excluding_vascular")
+
+meta_dt <- data.table(
+  sample_id = state$test_samples,
+  condition = state$y_test_chr,
+  y_bin = state$y_test
+)
+fwrite(
+  meta_dt,
+  file.path(CFG$out_dir, "tables",
+            paste0(CFG$prefix, "_test_", CFG$test_gse_id, "_", region_tag, "_sample_metadata.csv"))
+)
+
+writeLines(
+  missing_test_genes,
+  file.path(CFG$out_dir, "tables",
+            paste0(CFG$prefix, "_test_", CFG$test_gse_id, "_", region_tag, "_missing_genes.txt"))
+)
+
+test_gene_dt <- as.data.table(test_aligned, keep.rownames = "GeneSymbol")
+fwrite(
+  test_gene_dt,
+  file.path(CFG$out_dir, "tables",
+            paste0(CFG$prefix, "_test_", CFG$test_gse_id, "_", region_tag, "_gene_x_sample_aligned.csv"))
+)
+
+x_test_dt <- data.table(
+  sample_id = rownames(X_test),
+  as.data.table(X_test)
+)
+fwrite(
+  x_test_dt,
+  file.path(CFG$out_dir, "tables",
+            paste0(CFG$prefix, "_test_", CFG$test_gse_id, "_", region_tag, "_sample_x_gene_ready.csv"))
+)
+
+prep_dt <- data.table(
+  dataset = paste0("test_", CFG$test_gse_id, "_", region_tag),
+  n_genes_model = length(genes_used),
+  n_genes_matched = length(matched_test_genes),
+  n_genes_missing = length(missing_test_genes),
+  missing_fraction = missing_frac,
+  n_samples = nrow(X_test),
+  n_AD = sum(state$y_test == 1),
+  n_Control = sum(state$y_test == 0)
+)
+fwrite(
+  prep_dt,
+  file.path(CFG$out_dir, "tables",
+            paste0(CFG$prefix, "_test_", CFG$test_gse_id, "_", region_tag, "_prep_summary.csv"))
+)
+
+# ------------------------------------------------------------
+# 9) Store in state
+# ------------------------------------------------------------
+state$test_gene_mat_gxs <- test_aligned
+state$X_test <- X_test
+state$test_missing_genes <- missing_test_genes
+state$test_matched_genes <- matched_test_genes
+state$test_region_used <- TEST_REGION_USE
+
+log_msg("DONE EXTERNAL TEST PREPARATION: ", CFG$test_gse_id, " [", TEST_REGION_USE, "]")
