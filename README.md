@@ -47,8 +47,8 @@ AD vs AsymAD
 ### Preclinical Core Gene Set (PCGS)
 
 The preclinical core genes were defined as:
-PCGS = DEG(AsymAD vs Control)
-∩ (DEG(AD vs Control) ∪ DEG(AD vs AsymAD))
+```PCGS = DEG(AsymAD vs Control)
+∩ (DEG(AD vs Control) ∪ DEG(AD vs AsymAD))```
 
 
 These genes represent **early transcriptional changes associated with AD progression.**
@@ -80,7 +80,7 @@ The expanded gene set was further filtered using **Weighted Gene Co-expression N
 
 This step identifies **co-expression modules associated with disease progression** and removes noise genes.
 
-The resulting set is referred to as the: Preclinical Core Gene Network
+The resulting set is referred to as the Core Gene Network
 
 
 ---
@@ -94,10 +94,10 @@ Steps:
 1. Projection of candidate genes onto independent bulk datasets
 2. Probe-to-gene mapping and gene-level expression collapse
 3. Data standardization using training statistics
-4. **Feature selection using Elastic Net logistic regression**
+4. Feature selection using Elastic Net logistic regression
 5. Model training and performance evaluation
 
-Elastic Net was used instead of LASSO to account for **correlated gene expression features.**
+Elastic Net was used instead of LASSO to better account for correlated gene expression features.
 
 ---
 
@@ -106,7 +106,7 @@ Elastic Net was used instead of LASSO to account for **correlated gene expressio
 The trained model was evaluated on: GSE122063
 
 
-Model performance was measured using **ROC curves and AUC scores**.
+Model performance was measured using ROC curves and AUC scores.
 
 ---
 
@@ -133,13 +133,21 @@ Genes detected consistently across bulk transcriptomic datasets and single-cell 
 These genes represent **robust early-stage Alzheimer’s disease biomarkers.**
 
 ---
-
 # Repository structure
+```
+├── scripts/                 analysis scripts
+│   ├── 01_pcgs/             preclinical core gene set
+│   ├── 02_pca_expansion/    PCA-guided gene expansion
+│   ├── 03_wgcna/            co-expression network filtering
+│   ├── 04_elastic_net/      Elastic Net modeling
+│   └── 05_cross_platform/   snRNA cross-platform validation
+│
+├── R/utils/                 helper functions
+├── config/                  configuration parameters
+├── data/                    raw and processed datasets
+└── outputs/                 tables and figures
 
-
-
-
----
+```
 
 # Requirements
 
@@ -171,9 +179,11 @@ BiocManager::install(c("GEOquery","limma","WGCNA"))
 
 
 # Running the pipeline
+```
 Rscript scripts/run_all.R
 Outputs will be written to:
 outputs/
+```
 
 ## Key findings
 
