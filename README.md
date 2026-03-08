@@ -50,7 +50,7 @@ The preclinical core genes were defined as:
 
 ```PCGS = DEG(AsymAD vs Control)
 ∩ (DEG(AD vs Control) ∪ DEG(AD vs AsymAD))
-
+```
 
 These genes represent **early transcriptional changes associated with AD progression.**
 
@@ -147,7 +147,7 @@ These genes represent **robust early-stage Alzheimer’s disease biomarkers.**
 ├── data/                    raw and processed datasets
 └── outputs/                 tables and figures
 
-
+```
 
 # Requirements
 
