@@ -7,9 +7,9 @@ suppressPackageStartupMessages({
   library(stringr)
 })
 
-source("R/utils_geo.R")
-source("R/utils_model.R")
-source("config/config.R")
+source("R/utils/LASSO_test/geo.R")
+source("R/utils/LASSO_test/model.R")
+source("config//LASSO_test/config.R")
 
 # output dirs
 .dir_create(CFG$out_dir)
