@@ -47,13 +47,14 @@ AD vs AsymAD
 ### Preclinical Core Gene Set (PCGS)
 
 The preclinical core genes were defined as:
-```PCGS = DEG(AsymAD vs Control)
+
+```
+PCGS = DEG(AsymAD vs Control)
 ∩ (DEG(AD vs Control) ∪ DEG(AD vs AsymAD))```
 
 
 These genes represent **early transcriptional changes associated with AD progression.**
 
----
 
 ### PCA-based dimensionality reduction
 
