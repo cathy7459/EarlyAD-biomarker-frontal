@@ -1,3 +1,6 @@
+## Pipeline overview
+
+![Pipeline](https://raw.githubusercontent.com/cathy7459/EarlyAD-biomarker-frontal/main/figures/pipeline.jpg)
 # Early-stage Alzheimer’s biomarker discovery using integrative transcriptomic modeling
 
 This repository provides a **reproducible bioinformatics pipeline** for identifying robust early-stage Alzheimer’s disease (AD) biomarkers using integrative analysis of multiple transcriptomic datasets.
