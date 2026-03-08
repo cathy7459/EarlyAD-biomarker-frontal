@@ -1,6 +1,6 @@
-# scripts/04_prepare_external_test_set.R
-# source("config/config.R")
-# source("scripts/00_split_gse122063_by_region_and_diagnosis.R")
+# scripts/03_test.R
+source("config/LASSO_test.R")
+source("scripts/02_test_no_vasAD.R")
 
 CFG$test_region <- "frontal"   
 
