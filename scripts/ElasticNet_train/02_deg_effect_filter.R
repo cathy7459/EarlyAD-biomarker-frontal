@@ -1,7 +1,7 @@
 # scripts/02_deg_effect_filter.R
-source(file.path("scripts/LASSO_train/00_setup.R"))
+source(file.path("scripts/ElasticNet_train/00_setup.R"))
 
-log_msg("RUNNING FILE: scripts/02_deg_effect_filter.R")
+log_msg("RUNNING FILE: scripts/ElasticNet_train/02_deg_effect_filter.R")
 
 # ------------------------------------------------------------
 # 1) Load projected expression matrix
