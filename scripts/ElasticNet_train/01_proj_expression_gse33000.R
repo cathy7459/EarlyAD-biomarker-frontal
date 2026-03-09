@@ -1,5 +1,5 @@
 # scripts/01_proj_expression_gse33000.R
-source(file.path("scripts/LASSO_train/00_setup.R"))
+source(file.path("scripts/ElasticNet_train/00_setup.R"))
 
 log_msg("RUNNING FILE: scripts/01_proj_expression_gse33000.R")
 log_msg("GEOquery.destdir = ", getOption("GEOquery.destdir"))
