@@ -1,6 +1,6 @@
 
 # scripts/03_lasso_train.R
-source(file.path("scripts", "00_setup.R"))
+source(file.path("scripts/ElasticNet_train/00_setup.R"))
 
 log_msg("RUNNING FILE: scripts/03_lasso_train_validate.R")
 
