@@ -1,9 +1,14 @@
 # ============================
 # Configuration (edit this)
 # ============================
+
+gse <- getGEO("GSE33000", GSEMatrix = TRUE)[[1]]
+dir.create("data/raw", recursive = TRUE, showWarnings = FALSE)
+saveRDS(gse, "data/raw/GSE33000_series_matrix.rds")
+
 CFG <- list(
   # --- TRAIN (GSE33000) ---
-  train_series_matrix_gz = "data/raw/GSE33000_series_matrix.txt.gz",
+  train_series_matrix = "data/raw/GSE33000_series_matrix.rds",
   train_platform_id      = "GPL4372",
   core_gene_csv          = "outputs/WGCNA_significant_genes.csv",
 
@@ -15,10 +20,10 @@ CFG <- list(
   alpha                  = 1.0,     # 1=LASSO, 0=Ridge
   nfolds                 = 10,
   lambda_choice          = "lambda.1se",  # "lambda.min" or "lambda.1se"
-  model_bundle_rds = "outputs/trainGSE33000_testGSE122063_model_bundle.rds",
+  model_bundle_rds = "outputs/ad_lasso_model_bundle.rds",
   
   # --- Output ---
-  out_dir                = "outputs",
+  out_dir                = "outputs"
 
 )
 
