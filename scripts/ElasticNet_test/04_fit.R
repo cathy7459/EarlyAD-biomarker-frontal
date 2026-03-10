@@ -1,4 +1,4 @@
-# scripts/03b_enet_train_validate.R
+# scripts/04_fit.R
 
 log_msg("RUNNING FILE: scripts/03b_enet_train_validate.R")
 
@@ -9,7 +9,7 @@ suppressPackageStartupMessages({
 })
 
 if (!exists("state")) state <- new.env(parent = emptyenv())
-if (!exists("CFG")) stop("CFG not found. source('config/config.R') first.")
+#if (!exists("CFG")) stop("CFG not found. source('config/config.R') first.")
 
 # ============================================================
 # hyperparameter
@@ -17,7 +17,7 @@ if (!exists("CFG")) stop("CFG not found. source('config/config.R') first.")
 SEED <- 1234
 
 # moderately relaxed, but still conservative
-UNIV_TOP_N <- 60
+UNIV_TOP_N <- 30
 UNIV_METHOD <- "wilcox"
 USE_FDR_GATE <- TRUE
 FDR_CUTOFF <- 0.30
@@ -62,7 +62,7 @@ if (is.na(expr_path) || !nzchar(expr_path)) {
   )
 }
 
-meta_path <- file.path("data", "processed", "sample_metadata_gse33000.csv")
+meta_path <- file.path("data", "processed", "GSE33000_pheno.csv")
 if (!file.exists(meta_path)) {
   stop("Missing metadata: ", meta_path)
 }
@@ -222,6 +222,22 @@ get_oof_predictions <- function(x, y_bin, alpha, foldid, lambda_value) {
   
   pred
 }
+# ============================================================
+# Helper: normalize sample IDs robustly
+# ============================================================
+normalize_sample_ids <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("^X+", "", x)                 # remove leading X added by R
+  x <- gsub("\\.CEL(\\.gz)?$", "", x, ignore.case = TRUE)
+  x <- gsub("\\.gz$", "", x, ignore.case = TRUE)
+  x <- gsub("\\.txt$", "", x, ignore.case = TRUE)
+  x <- gsub("\\.csv$", "", x, ignore.case = TRUE)
+  x <- gsub("[[:space:]]+", "", x)        # remove all spaces
+  x <- gsub("[\"']", "", x)               # remove quotes
+  x <- gsub("\\.", "-", x)                # unify dot to dash
+  toupper(x)
+}
 
 # ============================================================
 # 1) Load expression matrix
@@ -232,8 +248,19 @@ expr_dt <- fread(expr_path)
 stopifnot("GeneSymbol" %in% names(expr_dt))
 
 expr <- as.data.frame(expr_dt[, -1, with = FALSE])
-rownames(expr) <- expr_dt$GeneSymbol
+rownames(expr) <- trimws(as.character(expr_dt$GeneSymbol))
 expr[] <- lapply(expr, as.numeric)
+
+# preserve original column names and create normalized sample IDs
+expr_sample_ids_raw <- colnames(expr)
+expr_sample_ids_norm <- normalize_sample_ids(expr_sample_ids_raw)
+
+# if duplicated after normalization, keep the first occurrence
+keep_expr_cols <- !duplicated(expr_sample_ids_norm)
+expr <- expr[, keep_expr_cols, drop = FALSE]
+expr_sample_ids_raw <- expr_sample_ids_raw[keep_expr_cols]
+expr_sample_ids_norm <- expr_sample_ids_norm[keep_expr_cols]
+colnames(expr) <- expr_sample_ids_norm
 
 # optional core-gene restriction from prior step
 core_genes <- NULL
@@ -259,24 +286,103 @@ log_msg("[2/7] Loading metadata: ", meta_path)
 
 meta <- as.data.frame(fread(meta_path))
 
-required_meta_cols <- c("sample_id", "condition")
-if (!all(required_meta_cols %in% names(meta))) {
-  stop("Metadata must contain columns: ", paste(required_meta_cols, collapse = ", "))
+# -----------------------------
+# Detect sample ID column
+# -----------------------------
+sample_id_candidates <- c(
+  "sample_id",
+  "geo_accession",
+  "geo accession",
+  "SampleID",
+  "sample",
+  "gsm",
+  "GSM"
+)
+
+sample_id_col <- sample_id_candidates[sample_id_candidates %in% names(meta)][1]
+
+if (is.na(sample_id_col) || !nzchar(sample_id_col)) {
+  stop(
+    "Could not find sample ID column in metadata.\nAvailable columns:\n",
+    paste(names(meta), collapse = ", ")
+  )
 }
 
-meta$sample_id <- trimws(as.character(meta$sample_id))
-meta$condition <- trimws(as.character(meta$condition))
-meta <- meta[meta$condition %in% c("AD", "Control"), , drop = FALSE]
-meta <- meta[!duplicated(meta$sample_id), , drop = FALSE]
+# -----------------------------
+# Detect / generate condition column
+# -----------------------------
+if (!"condition" %in% names(meta)) {
+  condition_source_candidates <- c(
+    "condition",
+    "diagnosis",
+    "diagnosis:ch1",
+    "disease status:ch2",
+    "group"
+  )
+  
+  condition_source_col <- condition_source_candidates[
+    condition_source_candidates %in% names(meta)
+  ][1]
+  
+  if (is.na(condition_source_col) || !nzchar(condition_source_col)) {
+    stop(
+      "Could not find condition column in metadata.\nAvailable columns:\n",
+      paste(names(meta), collapse = ", ")
+    )
+  }
+  
+  cond_raw <- trimws(as.character(meta[[condition_source_col]]))
+  cond_low <- tolower(cond_raw)
+  
+  meta$condition <- ifelse(
+    grepl("alzheimer's disease", cond_low),
+    "AD",
+    ifelse(
+      grepl("non-demented", cond_low),
+      "Control",
+      NA_character_
+    )
+  )
+}
 
-common_samples <- intersect(colnames(expr), meta$sample_id)
+# -----------------------------
+# Standardize metadata columns
+# -----------------------------
+meta$sample_id_raw  <- trimws(as.character(meta[[sample_id_col]]))
+meta$sample_id_norm <- normalize_sample_ids(meta$sample_id_raw)
+meta$condition      <- trimws(as.character(meta$condition))
+
+meta <- meta[meta$condition %in% c("AD", "Control"), , drop = FALSE]
+meta <- meta[!duplicated(meta$sample_id_norm), , drop = FALSE]
+
+# -----------------------------
+# Match expression and metadata using normalized IDs
+# -----------------------------
+common_samples <- intersect(colnames(expr), meta$sample_id_norm)
+
 if (length(common_samples) < 20) {
-  stop("Too few matched samples between expression and metadata: ", length(common_samples))
+  log_msg("[DEBUG] First expression sample IDs (raw):")
+  print(head(expr_sample_ids_raw, 10))
+  log_msg("[DEBUG] First expression sample IDs (normalized):")
+  print(head(colnames(expr), 10))
+  log_msg("[DEBUG] First metadata sample IDs (raw):")
+  print(head(meta$sample_id_raw, 10))
+  log_msg("[DEBUG] First metadata sample IDs (normalized):")
+  print(head(meta$sample_id_norm, 10))
+  
+  stop(
+    "Too few matched samples between expression and metadata: ", length(common_samples),
+    "\nCheck whether sample IDs use different formats."
+  )
 }
 
 expr <- expr[, common_samples, drop = FALSE]
-meta <- meta[match(common_samples, meta$sample_id), , drop = FALSE]
-stopifnot(identical(colnames(expr), meta$sample_id))
+meta <- meta[match(common_samples, meta$sample_id_norm), , drop = FALSE]
+
+stopifnot(identical(colnames(expr), meta$sample_id_norm))
+
+# restore raw sample IDs for downstream outputs
+colnames(expr) <- meta$sample_id_raw
 
 log_msg("[2/7] Matched samples: ", ncol(expr))
 log_msg("[2/7] AD samples: ", sum(meta$condition == "AD"))
@@ -289,6 +395,7 @@ log_msg("[3/7] Building model matrix")
 
 x <- t(as.matrix(expr))
 storage.mode(x) <- "double"
+rownames(x) <- colnames(expr)
 
 if (anyNA(x)) {
   log_msg("[3/7] NA detected -> median imputation")
