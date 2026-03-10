@@ -17,7 +17,7 @@ if (!exists("state")) state <- new.env(parent = emptyenv())
 SEED <- 1234
 
 # moderately relaxed, but still conservative
-UNIV_TOP_N <- 30
+UNIV_TOP_N <- 60
 UNIV_METHOD <- "wilcox"
 USE_FDR_GATE <- TRUE
 FDR_CUTOFF <- 0.30
