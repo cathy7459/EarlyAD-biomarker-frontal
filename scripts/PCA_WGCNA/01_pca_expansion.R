@@ -17,7 +17,7 @@ suppressPackageStartupMessages({
   library(limma)
 })
 
-source(file.path("R", "utils","PCA_WGCNA.R"))
+#source(file.path("R", "utils","PCA_WGCNA.R"))
 
 # Required packages
 suppressPackageStartupMessages({
@@ -127,7 +127,7 @@ cat("Using PCs:", paste(colnames(scores), collapse = ", "), "\n")
 m_and <- 2
 alpha <- 0.05
 alpha_soft <- 0.10
-target_max <- 800 
+target_max <- 3000 
 
 # --- 2) Correlations
 log_step("PCA expansion | correlation with PCs (simple + partial)")
