@@ -182,7 +182,7 @@ plot(
   xvar = "lambda",
   label = FALSE,
   main = sprintf(
-    "Coefficient Path (%s model | alpha = %s)",
+    "Coefficient Path (%s model | alpha = %s)\n",
     TEST_REGION_USE,
     if (!is.null(bundle$alpha_use)) format(round(bundle$alpha_use, 3), nsmall = 3) else "NA"
   )
@@ -219,3 +219,4 @@ log_msg("[SUMMARY] ROC saved to: ", out_roc_ext)
 log_msg("[SUMMARY] Coefficient path saved to: ", out_coef_path)
 
 log_msg("DONE external validation. AUC = ", round(auc_ext, 4))
+
