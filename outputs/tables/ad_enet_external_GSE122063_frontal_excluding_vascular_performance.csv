@@ -1,0 +1,2 @@
+dataset,region,auc,accuracy_0.5,sensitivity_0.5,specificity_0.5,n_samples,n_AD,n_Control,alpha_use,lambda_use,matched_genes,missing_genes_imputed
+GSE122063,frontal,0.87987012987013,0.44,0,1,50,28,22,0.85,0.0162979980821773,32,0
