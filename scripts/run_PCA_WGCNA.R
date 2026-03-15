@@ -7,7 +7,7 @@
 #   1) Source your preprocessing code (that creates the required objects)
 #   2) source("scripts/run_all.R")  OR  Rscript scripts/run_all.R after saving .RData
 
-source(file.path("R", "utils.R"))
+source(file.path("R/utils", PCA_WGCNA.R"))
 
 log_step("Run all | note")
 cat("This repo starts from objects produced upstream (preprocessing / GEO import).\n",
