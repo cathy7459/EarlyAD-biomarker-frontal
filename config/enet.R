@@ -1,4 +1,4 @@
-# config/config.R
+# config/enet.R
 # Central configuration for the Early AD Elastic Net pipeline.
 # R version target: 4.5.1
 
