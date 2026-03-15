@@ -6,10 +6,10 @@ suppressPackageStartupMessages({
   library(stringr)
 })
 
-#source(file.path("config", "config.R"))
-#source(file.path("R", "utils_io.R"))
-#source(file.path("R", "utils_geo.R"))
-#source(file.path("R", "utils_model.R"))
+source(file.path("config", "enet.R"))
+source(file.path("R/utils", "enet_io.R"))
+source(file.path("R/utils","enet_geo.R"))
+source(file.path("R/utils", "enet_model.R"))
 
 .dir_create(CFG$out_dir)
 .dir_create(file.path(CFG$out_dir, "tables"))
