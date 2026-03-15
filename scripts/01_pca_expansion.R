@@ -17,7 +17,7 @@ suppressPackageStartupMessages({
   library(limma)
 })
 
-#source(file.path("R", "utils","PCA_WGCNA.R"))
+source(file.path("R", "utils","PCA_WGCNA.R"))
 
 # Required packages
 suppressPackageStartupMessages({
