@@ -1,4 +1,4 @@
-log_msg("RUNNING FILE: scripts/05_external_validate_gse122063.R")
+log_msg("RUNNING FILE: scripts/08_external_validate_gse122063.R")
 
 if (!exists("state")) state <- new.env(parent = emptyenv())
 if (!exists("CFG")) stop("CFG not found. source('config/config.R') first.")
