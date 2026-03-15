@@ -1,4 +1,4 @@
-# R/utils_io.R
+# R/utils/enet_io.R
 suppressPackageStartupMessages({
   library(data.table)
 })
