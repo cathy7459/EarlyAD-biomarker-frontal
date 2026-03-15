@@ -1,4 +1,4 @@
-# R/utils_geo.R
+# R/utils/enet_geo.R
 suppressPackageStartupMessages({
   library(data.table)
   library(GEOquery)
