@@ -1,4 +1,4 @@
-# utils.R ----
+# PCA_WGCNA.R ----
 # Small helpers to keep scripts readable and reproducible.
 
 log_step <- function(title) {
