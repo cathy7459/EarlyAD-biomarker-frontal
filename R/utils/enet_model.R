@@ -1,4 +1,4 @@
-# R/utils_model.R
+# R/utils/enet_model.R
 suppressPackageStartupMessages({
   library(data.table)
   library(glmnet)
