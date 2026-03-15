@@ -1,4 +1,4 @@
-log_msg("RUNNING FILE: scripts/03b_enet_train_validate.R")
+log_msg("RUNNING FILE: scripts/06_enet_train_validate.R")
 
 # ============================================================
 # 0) Paths
